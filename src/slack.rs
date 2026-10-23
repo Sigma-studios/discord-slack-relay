@@ -1,10 +1,13 @@
 //! Slack side: Socket Mode listener (Slack→Discord, membership, channel and pin
 //! events) and the bot poster/editor (Discord→Slack).
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use slack_morphism::prelude::*;
+use tokio::sync::mpsc;
 
 use crate::media::{self, DownloadedFile};
 use crate::relay::AppState;
@@ -128,6 +131,11 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     if is_our_bot(state, &ev.sender) || state.db.is_self_posted(&ts).await? {
         return Ok(());
     }
+    // Already mirrored (a redelivered event, e.g. after a restart).
+    if state.db.message_by_slack_ts(&channel_id, &ts).await?.is_some() {
+        tracing::debug!(%channel_id, %ts, "slack message already mirrored; skipping");
+        return Ok(());
+    }
 
     let content = ev.content.as_ref();
     let text = content.and_then(|c| c.text.clone()).unwrap_or_default();
@@ -232,6 +240,8 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         )
         .await?;
     }
+
+    tracing::debug!(%channel_id, %ts, files = files.len(), "relayed slack message to discord");
 
     let discord_thread = posted.thread_id.map(|t| t.to_string());
     state
@@ -479,13 +489,7 @@ async fn refresh_topic(state: &AppState, channel_id: &str) -> Result<()> {
 /// channel lifecycle (`group_*`) and pins.
 async fn handle_raw_event(state: &AppState, v: &serde_json::Value) -> Result<()> {
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-    // `channel` is an id string for most events, an object for renames.
-    let channel_id = v
-        .get("channel")
-        .and_then(|c| c.as_str().or_else(|| c.get("id").and_then(|i| i.as_str())))
-        .or_else(|| v.get("channel_id").and_then(|c| c.as_str()))
-        .unwrap_or_default()
-        .to_string();
+    let channel_id = raw_channel_id(v);
     match kind {
         "group_rename" => {
             let name = v.pointer("/channel/name").and_then(|n| n.as_str());
@@ -511,6 +515,16 @@ async fn handle_raw_event(state: &AppState, v: &serde_json::Value) -> Result<()>
         _ => tracing::trace!(%kind, "unhandled raw slack event"),
     }
     Ok(())
+}
+
+/// Channel id of a raw event: `channel` is an id string for most events, an
+/// object for renames; pins use `channel_id`.
+fn raw_channel_id(v: &serde_json::Value) -> String {
+    v.get("channel")
+        .and_then(|c| c.as_str().or_else(|| c.get("id").and_then(|i| i.as_str())))
+        .or_else(|| v.get("channel_id").and_then(|c| c.as_str()))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// A Slack channel was deleted: stop mirroring and mark the Discord channel.
@@ -547,7 +561,10 @@ pub async fn run_socket_mode(state: AppState) -> Result<()> {
     Ok(())
 }
 
-/// Dispatch a Socket Mode push event to the right handler.
+/// Socket Mode callback. Slack only counts an event as delivered once this
+/// returns (the ack is sent afterwards) and redelivers it after ~3 s, so the
+/// work is queued and this returns immediately. Mirroring a picture used to
+/// take longer than that, and every redelivery posted it again.
 async fn on_push_event(
     event: SlackPushEventCallback,
     _client: Arc<SlackClient<SlackHyperConnector>>,
@@ -560,54 +577,147 @@ async fn on_push_event(
             .cloned()
             .ok_or("AppState missing from listener user state")?
     };
+    let event_id = event.event_id.to_string();
+    if !first_sighting(&event_id) {
+        tracing::debug!(%event_id, "slack redelivered an event already handled; ignoring");
+        return Ok(());
+    }
+    let key = queue_key(&event.event);
+    enqueue(&state, key, event.event);
+    Ok(())
+}
 
-    let result = match event.event {
-        SlackEventCallbackBody::Message(ev) => handle_slack_message(&state, &ev).await,
+/// Recently handled event ids (bounded), for dropping Slack redeliveries.
+struct Seen {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+const SEEN_CAPACITY: usize = 2000;
+
+static SEEN: Lazy<Mutex<Seen>> = Lazy::new(|| {
+    Mutex::new(Seen { ids: HashSet::new(), order: VecDeque::new() })
+});
+
+fn first_sighting(event_id: &str) -> bool {
+    let mut seen = SEEN.lock().expect("seen-set lock poisoned");
+    if !seen.ids.insert(event_id.to_string()) {
+        return false;
+    }
+    seen.order.push_back(event_id.to_string());
+    if seen.order.len() > SEEN_CAPACITY {
+        if let Some(oldest) = seen.order.pop_front() {
+            seen.ids.remove(&oldest);
+        }
+    }
+    true
+}
+
+/// One ordered worker per Slack channel: events for a channel are handled in
+/// arrival order (a slow picture can't be overtaken by the next message), while
+/// channels proceed independently.
+static QUEUES: Lazy<Mutex<HashMap<String, mpsc::UnboundedSender<SlackEventCallbackBody>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn enqueue(state: &AppState, key: String, body: SlackEventCallbackBody) {
+    let mut queues = QUEUES.lock().expect("queue map lock poisoned");
+    let tx = queues.entry(key).or_insert_with(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SlackEventCallbackBody>();
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(body) = rx.recv().await {
+                if let Err(e) = dispatch(&state, body).await {
+                    tracing::error!(error = ?e, "slack event handler failed");
+                }
+            }
+        });
+        tx
+    });
+    if tx.send(body).is_err() {
+        tracing::error!("slack event worker stopped; event dropped");
+    }
+}
+
+/// The Slack channel an event belongs to, used as its queue key.
+fn queue_key(body: &SlackEventCallbackBody) -> String {
+    let channel = match body {
+        SlackEventCallbackBody::Message(ev) => ev.origin.channel.as_ref().map(|c| c.to_string()),
+        SlackEventCallbackBody::MemberJoinedChannel(ev) => Some(ev.channel.to_string()),
+        SlackEventCallbackBody::MemberLeftChannel(ev) => Some(ev.channel.to_string()),
+        SlackEventCallbackBody::ChannelArchive(ev) => Some(ev.channel.to_string()),
+        SlackEventCallbackBody::ChannelUnarchive(ev) => Some(ev.channel.to_string()),
+        SlackEventCallbackBody::ChannelRename(ev) => Some(ev.channel.id.to_string()),
+        SlackEventCallbackBody::ChannelDeleted(ev) => Some(ev.channel.to_string()),
+        SlackEventCallbackBody::Unknown(v) => Some(raw_channel_id(v)).filter(|c| !c.is_empty()),
+        _ => None,
+    };
+    channel.unwrap_or_else(|| "_other".to_string())
+}
+
+/// Route one Slack event to its handler.
+async fn dispatch(state: &AppState, body: SlackEventCallbackBody) -> Result<()> {
+    match body {
+        SlackEventCallbackBody::Message(ev) => handle_slack_message(state, &ev).await,
         SlackEventCallbackBody::MemberJoinedChannel(ev) => {
             if ev.user.to_string() == state.bot_user_id {
-                handle_bot_membership(&state, ev.channel.as_ref(), true).await
+                handle_bot_membership(state, ev.channel.as_ref(), true).await
             } else {
                 Ok(())
             }
         }
         SlackEventCallbackBody::MemberLeftChannel(ev) => {
             if ev.user.to_string() == state.bot_user_id {
-                handle_bot_membership(&state, ev.channel.as_ref(), false).await
+                handle_bot_membership(state, ev.channel.as_ref(), false).await
             } else {
                 Ok(())
             }
         }
-        SlackEventCallbackBody::ChannelArchive(ev) => {
-            set_archived(&state, ev.channel.as_ref(), true).await
-        }
+        SlackEventCallbackBody::ChannelArchive(ev) => set_archived(state, ev.channel.as_ref(), true).await,
         SlackEventCallbackBody::ChannelUnarchive(ev) => {
-            set_archived(&state, ev.channel.as_ref(), false).await
+            set_archived(state, ev.channel.as_ref(), false).await
         }
         SlackEventCallbackBody::ChannelRename(ev) => {
             if let (Some(pair), Some(name)) = (
                 state.db.pair_by_slack(ev.channel.id.as_ref()).await?,
                 ev.channel.name.clone(),
             ) {
-                crate::discord::rename_channel(&state, &pair, &name).await
+                crate::discord::rename_channel(state, &pair, &name).await
             } else {
                 Ok(())
             }
         }
-        SlackEventCallbackBody::ChannelDeleted(ev) => archive_deleted(&state, ev.channel.as_ref()).await,
-        SlackEventCallbackBody::Unknown(v) => handle_raw_event(&state, &v).await,
+        SlackEventCallbackBody::ChannelDeleted(ev) => archive_deleted(state, ev.channel.as_ref()).await,
+        SlackEventCallbackBody::Unknown(v) => handle_raw_event(state, &v).await,
         other => {
             tracing::trace!(?other, "unhandled slack event");
             Ok(())
         }
-    };
-
-    if let Err(e) = result {
-        tracing::error!(error = ?e, "slack event handler failed");
     }
-    Ok(())
 }
 
 async fn set_archived(state: &AppState, channel_id: &str, archived: bool) -> Result<()> {
     state.db.set_archived(channel_id, archived).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redelivered_events_are_dropped() {
+        assert!(first_sighting("Ev-test-1"));
+        assert!(!first_sighting("Ev-test-1"));
+        assert!(first_sighting("Ev-test-2"));
+    }
+
+    #[test]
+    fn seen_set_stays_bounded() {
+        for i in 0..(SEEN_CAPACITY + 10) {
+            first_sighting(&format!("Ev-bound-{i}"));
+        }
+        let seen = SEEN.lock().unwrap();
+        assert!(seen.ids.len() <= SEEN_CAPACITY);
+        assert_eq!(seen.ids.len(), seen.order.len());
+    }
 }
