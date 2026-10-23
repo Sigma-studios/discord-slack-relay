@@ -69,6 +69,14 @@ async fn main() -> Result<()> {
         })
         .await?;
 
+    // Mirror channels the bot was invited to while the relay wasn't running.
+    let reconcile_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = slack::reconcile_memberships(&reconcile_state).await {
+            tracing::warn!(error = ?e, "membership reconciliation failed");
+        }
+    });
+
     // Heartbeat loop for the container healthcheck.
     let hb_state = state.clone();
     tokio::spawn(async move {

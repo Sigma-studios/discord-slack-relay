@@ -108,8 +108,17 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let content = ev.content.as_ref();
     let text = content.and_then(|c| c.text.clone()).unwrap_or_default();
 
-    let Some(pair) = state.db.pair_by_slack(&channel_id).await? else {
-        return Ok(());
+    // We only receive messages for channels the bot is in, so an unpaired
+    // channel means a missed join event: provision it now.
+    let pair = match state.db.pair_by_slack(&channel_id).await? {
+        Some(p) => p,
+        None => {
+            handle_bot_membership(state, &channel_id, true).await?;
+            match state.db.pair_by_slack(&channel_id).await? {
+                Some(p) => p,
+                None => return Ok(()),
+            }
+        }
     };
     if pair.archived != 0 {
         return Ok(());
@@ -205,6 +214,49 @@ pub async fn handle_bot_membership(state: &AppState, channel_id: &str, joined: b
     Ok(())
 }
 
+/// Provision Discord mirrors for every Slack channel the bot is already in.
+/// Covers invites that happened while the relay wasn't running (no
+/// member_joined_channel event reached us), and resumes archived pairs.
+pub async fn reconcile_memberships(state: &AppState) -> Result<()> {
+    let session = state.slack.open_session(&state.slack_bot_token);
+    let mut cursor: Option<SlackCursorId> = None;
+    let mut provisioned = 0usize;
+    loop {
+        let mut req = SlackApiUsersConversationsRequest::new()
+            .with_types(vec![SlackConversationType::Public, SlackConversationType::Private])
+            .with_exclude_archived(true)
+            .with_limit(200);
+        if let Some(c) = cursor.take() {
+            req = req.with_cursor(c);
+        }
+        let resp = session
+            .users_conversations(&req)
+            .await
+            .context("users.conversations")?;
+        for ch in resp.channels {
+            let id = ch.id.to_string();
+            match state.db.pair_by_slack(&id).await? {
+                Some(pair) if pair.archived != 0 => state.db.set_archived(&id, false).await?,
+                Some(_) => {}
+                None => {
+                    let name = ch.name.clone().unwrap_or_else(|| id.clone());
+                    let is_private = ch.flags.is_private.unwrap_or(false);
+                    match crate::discord::provision_channel(state, &id, &name, is_private).await {
+                        Ok(_) => provisioned += 1,
+                        Err(e) => tracing::warn!(channel = %id, error = ?e, "startup provisioning failed"),
+                    }
+                }
+            }
+        }
+        match resp.response_metadata.and_then(|m| m.next_cursor) {
+            Some(c) if !c.to_string().is_empty() => cursor = Some(c),
+            _ => break,
+        }
+    }
+    tracing::info!(provisioned, "reconciled slack channel memberships");
+    Ok(())
+}
+
 fn token_value(token: &SlackApiToken) -> String {
     token.token_value.value().clone()
 }
@@ -249,27 +301,27 @@ async fn on_push_event(
         SlackEventCallbackBody::Message(ev) => handle_slack_message(&state, &ev).await,
         SlackEventCallbackBody::MemberJoinedChannel(ev) => {
             if ev.user.to_string() == state.bot_user_id {
-                handle_bot_membership(&state, &ev.channel.to_string(), true).await
+                handle_bot_membership(&state, ev.channel.as_ref(), true).await
             } else {
                 Ok(())
             }
         }
         SlackEventCallbackBody::MemberLeftChannel(ev) => {
             if ev.user.to_string() == state.bot_user_id {
-                handle_bot_membership(&state, &ev.channel.to_string(), false).await
+                handle_bot_membership(&state, ev.channel.as_ref(), false).await
             } else {
                 Ok(())
             }
         }
         SlackEventCallbackBody::ChannelArchive(ev) => {
-            set_archived(&state, &ev.channel.to_string(), true).await
+            set_archived(&state, ev.channel.as_ref(), true).await
         }
         SlackEventCallbackBody::ChannelUnarchive(ev) => {
-            set_archived(&state, &ev.channel.to_string(), false).await
+            set_archived(&state, ev.channel.as_ref(), false).await
         }
         SlackEventCallbackBody::ChannelRename(ev) => {
             if let (Some(pair), Some(name)) = (
-                state.db.pair_by_slack(&ev.channel.id.to_string()).await?,
+                state.db.pair_by_slack(ev.channel.id.as_ref()).await?,
                 ev.channel.name.clone(),
             ) {
                 crate::discord::rename_channel(&state, &pair, &name).await
