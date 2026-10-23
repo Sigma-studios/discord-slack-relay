@@ -105,24 +105,35 @@ pub async fn post_to_discord(
     // Users may be pinged (alias tags); @everyone only when the Slack message
     // pinged our bot, so a literal "@everyone" from Slack can't mass-ping.
     let mentions = CreateAllowedMentions::new().all_users(true).everyone(ping_everyone);
-    let mut builder = ExecuteWebhook::new().username(sender_name).allowed_mentions(mentions);
-    // Discord rejects empty content; send a zero-width space if text is empty.
-    builder = builder.content(if content.is_empty() { "\u{200b}" } else { content });
-    if let Some(avatar) = sender_avatar {
-        builder = builder.avatar_url(avatar);
+    // Discord caps messages at 2000 chars: post long text as several messages,
+    // files on the last one. The first message is the one mapped for edits.
+    let chunks = crate::format::split_for_discord(content, crate::format::DISCORD_MAX_CHARS);
+    let last = chunks.len() - 1;
+    let mut first_id = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut builder = ExecuteWebhook::new()
+            .username(sender_name)
+            .allowed_mentions(mentions.clone())
+            // Discord rejects empty content; a zero-width space stands in.
+            .content(if chunk.is_empty() { "\u{200b}" } else { chunk.as_str() });
+        if let Some(avatar) = sender_avatar {
+            builder = builder.avatar_url(avatar);
+        }
+        if let Some(tid) = thread_id {
+            builder = builder.in_thread(ChannelId::new(tid));
+        }
+        if i == last {
+            for f in files {
+                builder = builder.add_file(CreateAttachment::bytes(f.bytes.clone(), f.filename.clone()));
+            }
+        }
+        let msg = webhook
+            .execute(&state.discord, true, builder)
+            .await?
+            .context("webhook execute returned no message (need wait=true)")?;
+        first_id.get_or_insert(msg.id.get());
     }
-    if let Some(tid) = thread_id {
-        builder = builder.in_thread(ChannelId::new(tid));
-    }
-    for f in files {
-        builder = builder.add_file(CreateAttachment::bytes(f.bytes.clone(), f.filename.clone()));
-    }
-
-    let msg = webhook
-        .execute(&state.discord, true, builder)
-        .await?
-        .context("webhook execute returned no message (need wait=true)")?;
-    Ok(msg.id.get())
+    first_id.context("nothing posted")
 }
 
 async fn pair_webhook(state: &AppState, pair: &ChannelPair) -> Result<Webhook> {
@@ -144,7 +155,11 @@ pub async fn edit_on_discord(
 ) -> Result<()> {
     let webhook = pair_webhook(state, pair).await?;
     let mut builder = EditWebhookMessage::new()
-        .content(if content.is_empty() { "\u{200b}" } else { content })
+        .content(if content.is_empty() {
+            "\u{200b}".to_string()
+        } else {
+            crate::format::truncate_for_discord(content)
+        })
         // Edits never re-ping on Discord; keep @everyone inert regardless.
         .allowed_mentions(CreateAllowedMentions::new().all_users(true).everyone(false));
     if let Some(tid) = thread_id {

@@ -93,6 +93,42 @@ pub fn discord_to_slack(input: &str) -> String {
     })
 }
 
+/// Discord's per-message character limit.
+pub const DISCORD_MAX_CHARS: usize = 2000;
+
+/// Split text into chunks of at most `max` characters, preferring to break at a
+/// newline, then a space, so long Slack posts (up to 40k chars) fit Discord.
+pub fn split_for_discord(text: &str, max: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while rest.chars().count() > max {
+        // Byte index of the `max`-th char boundary.
+        let hard = rest.char_indices().nth(max).map_or(rest.len(), |(i, _)| i);
+        let window = &rest[..hard];
+        let cut = window
+            .rfind('\n')
+            .or_else(|| window.rfind(' '))
+            .filter(|&i| i > 0)
+            .unwrap_or(hard);
+        chunks.push(rest[..cut].to_string());
+        rest = rest[cut..].trim_start_matches(['\n', ' ']);
+    }
+    if !rest.is_empty() || chunks.is_empty() {
+        chunks.push(rest.to_string());
+    }
+    chunks
+}
+
+/// Truncate to Discord's limit (for edits, which can't be split).
+pub fn truncate_for_discord(text: &str) -> String {
+    if text.chars().count() <= DISCORD_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(DISCORD_MAX_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
 /// Decode the handful of HTML entities Slack escapes in message text.
 pub fn decode_entities(s: &str) -> String {
     s.replace("&amp;", "&")
@@ -185,6 +221,18 @@ mod tests {
         assert_eq!(discord_to_slack("the end: ||he dies||"), "the end: [spoiler hidden]");
         assert_eq!(discord_to_slack("__under__ line"), "under line");
         assert_eq!(discord_to_slack("# Title\nbody\n-# small"), "*Title*\nbody\n_small_");
+    }
+
+    #[test]
+    fn splits_long_text_at_line_breaks() {
+        let text = format!("{}\n{}", "a".repeat(1500), "b".repeat(1500));
+        let parts = split_for_discord(&text, DISCORD_MAX_CHARS);
+        assert_eq!(parts, vec!["a".repeat(1500), "b".repeat(1500)]);
+        assert_eq!(split_for_discord("short", DISCORD_MAX_CHARS), vec!["short"]);
+        let unbroken = "x".repeat(4500);
+        let parts = split_for_discord(&unbroken, DISCORD_MAX_CHARS);
+        assert_eq!(parts.iter().map(|p| p.chars().count()).collect::<Vec<_>>(), vec![2000, 2000, 500]);
+        assert_eq!(truncate_for_discord(&unbroken).chars().count(), DISCORD_MAX_CHARS);
     }
 
     #[test]
