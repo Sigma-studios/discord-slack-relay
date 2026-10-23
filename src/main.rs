@@ -22,6 +22,8 @@ async fn main() -> Result<()> {
     // Load .env in local dev if present (ignored in container).
     let _ = dotenv_lite();
     tracing_subscriber::fmt()
+        // Plain text: façade logs don't render ANSI colours.
+        .with_ansi(false)
         // Without RUST_LOG, EnvFilter defaults to errors only, which hid every
         // relay warning in production. Default to our debug + library warnings.
         .with_env_filter(

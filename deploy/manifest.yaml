@@ -18,6 +18,7 @@ oauth_config:
       - chat:write
       - chat:write.customize
       - files:write
+      - pins:read
 settings:
   event_subscriptions:
     bot_events:
@@ -28,6 +29,13 @@ settings:
       - channel_rename
       - channel_archive
       - channel_unarchive
+      - channel_deleted
+      - group_rename
+      - group_archive
+      - group_unarchive
+      - group_deleted
+      - pin_added
+      - pin_removed
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

@@ -41,10 +41,11 @@ out runtime issues (intents, scope gaps, thread edge cases) during setup.
    → `SLACK_APP_TOKEN`.
 3. **Bot token scopes**: `channels:history`, `groups:history`, `channels:read`,
    `groups:read`, `users:read`, `files:read`, `chat:write`,
-   `chat:write.customize`, `files:write`. Install → `SLACK_BOT_TOKEN`.
+   `chat:write.customize`, `files:write`, `pins:read`. Install → `SLACK_BOT_TOKEN`.
 4. **Event subscriptions** (bot events): `message.channels`, `message.groups`,
    `member_joined_channel`, `member_left_channel`, `channel_rename`,
-   `channel_archive`, `channel_unarchive`.
+   `channel_archive`, `channel_unarchive`, `channel_deleted`, `group_rename`,
+   `group_archive`, `group_unarchive`, `group_deleted`, `pin_added`, `pin_removed`.
 5. Invite the bot to a channel: `/invite @yourbot`.
 
 Tip: the **App Manifest** page sets all of the above (scopes, Socket Mode,
@@ -55,7 +56,8 @@ events) in one save — see `deploy/manifest.yaml`.
 1. Create a bot (<https://discord.com/developers>), enable the **Message Content**
    intent.
 2. Invite it to your server with **Manage Channels**, **Manage Webhooks**,
-   **Send Messages**, **Create Public Threads**.
+   **Send Messages**, **Create Public Threads**, **Pin Messages** (for mirrored
+   pins).
 3. Put the server id in `DISCORD_GUILD_ID`, the token in `DISCORD_BOT_TOKEN`.
 
 ## Run locally

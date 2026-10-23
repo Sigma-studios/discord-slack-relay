@@ -108,6 +108,12 @@ impl AppState {
                 ping_everyone = true;
                 continue;
             }
+            // Linked to a Discord account (same alias via !alias + !slackalias)
+            // → a real ping; otherwise the bold display name.
+            if let Ok(Some(discord_id)) = self.db.discord_id_for_slack_user(&cap[1]).await {
+                out = out.replace(&cap[0], &format!("<@{discord_id}>"));
+                continue;
+            }
             let name = self.slack_display_name(&cap[1], None).await;
             out = out.replace(&cap[0], &format!("**@{name}**"));
         }

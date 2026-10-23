@@ -9,8 +9,14 @@ use serenity::all::{
 };
 use serenity::async_trait;
 use serenity::model::channel::Message;
+use serenity::model::event::MessageUpdateEvent;
+use serenity::model::gateway::Ready;
+use serenity::model::user::User;
 use serenity::model::id::{ChannelId, MessageId, WebhookId};
 use serenity::prelude::{Context as SerenityContext, EventHandler};
+
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 use crate::db::ChannelPair;
 use crate::media;
@@ -91,7 +97,7 @@ pub async fn post_to_discord(
     sender_avatar: Option<&str>,
     content: &str,
     thread_id: Option<u64>,
-    files: Vec<media::DownloadedFile>,
+    files: &[media::DownloadedFile],
     ping_everyone: bool,
 ) -> Result<u64> {
     let webhook = pair_webhook(state, pair).await?;
@@ -109,7 +115,7 @@ pub async fn post_to_discord(
         builder = builder.in_thread(ChannelId::new(tid));
     }
     for f in files {
-        builder = builder.add_file(CreateAttachment::bytes(f.bytes, f.filename));
+        builder = builder.add_file(CreateAttachment::bytes(f.bytes.clone(), f.filename.clone()));
     }
 
     let msg = webhook
@@ -166,6 +172,49 @@ pub async fn delete_on_discord(
     Ok(())
 }
 
+/// Set the Discord channel topic (Discord caps topics at 1024 chars).
+pub async fn set_topic(state: &AppState, pair: &ChannelPair, topic: &str) -> Result<()> {
+    let topic: String = topic.chars().take(1024).collect();
+    let cid = ChannelId::new(pair.discord_channel_id.parse()?);
+    cid.edit(&state.discord, EditChannel::new().topic(topic))
+        .await
+        .context("set channel topic")?;
+    Ok(())
+}
+
+/// Pin or unpin a Discord message (in its thread when it lives in one).
+pub async fn set_pinned(
+    state: &AppState,
+    pair: &ChannelPair,
+    message_id: u64,
+    thread_id: Option<u64>,
+    pinned: bool,
+) -> Result<()> {
+    let cid = match thread_id {
+        Some(t) => ChannelId::new(t),
+        None => ChannelId::new(pair.discord_channel_id.parse()?),
+    };
+    let mid = MessageId::new(message_id);
+    if pinned {
+        cid.pin(&state.discord, mid).await.context("pin message")?;
+    } else {
+        cid.unpin(&state.discord, mid).await.context("unpin message")?;
+    }
+    Ok(())
+}
+
+/// True when Discord says the mirrored channel or its webhook no longer exists
+/// (someone deleted the channel), so the pairing must be recreated.
+pub fn is_gone(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<serenity::Error>(),
+            Some(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
+                if matches!(r.error.code, 10003 | 10015)
+        )
+    })
+}
+
 /// Create a Discord thread hanging off the mirrored parent message, returning
 /// the new thread's channel id.
 pub async fn create_thread_on(
@@ -212,11 +261,137 @@ pub struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
+    async fn ready(&self, _ctx: SerenityContext, ready: Ready) {
+        tracing::info!(bot = %ready.user.name, guilds = ready.guilds.len(), "discord gateway connected");
+    }
+
     async fn message(&self, ctx: SerenityContext, msg: Message) {
         if let Err(e) = handle_discord_message(&self.state, &ctx, &msg).await {
             tracing::error!(error = ?e, "discord→slack relay failed");
         }
     }
+
+    async fn message_update(
+        &self,
+        ctx: SerenityContext,
+        _old: Option<Message>,
+        _new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        if let Err(e) = handle_discord_edit(&self.state, &ctx, &event).await {
+            tracing::error!(error = ?e, "discord→slack edit failed");
+        }
+    }
+
+    async fn message_delete(
+        &self,
+        _ctx: SerenityContext,
+        _channel_id: ChannelId,
+        deleted_message_id: MessageId,
+        _guild_id: Option<GuildId>,
+    ) {
+        if let Err(e) = handle_discord_delete(&self.state, deleted_message_id).await {
+            tracing::error!(error = ?e, "discord→slack delete failed");
+        }
+    }
+}
+
+/// A Discord message we relayed was edited → update the Slack copy.
+async fn handle_discord_edit(
+    state: &AppState,
+    ctx: &SerenityContext,
+    ev: &MessageUpdateEvent,
+) -> Result<()> {
+    // No content means an embed/preview-only update.
+    let Some(content) = ev.content.as_ref() else { return Ok(()) };
+    if ev.author.as_ref().is_some_and(|a| a.bot) {
+        return Ok(());
+    }
+    let Some((slack_channel, ts, origin)) =
+        state.db.slack_ref_for_discord_msg(&ev.id.to_string()).await?
+    else {
+        return Ok(());
+    };
+    // Only our bot's own Slack posts are editable; file shares have no ts.
+    if origin != "discord" || ts.is_empty() {
+        return Ok(());
+    }
+    let mentions = ev.mentions.clone().unwrap_or_default();
+    let converted = discord_mentions_to_slack(state, ctx, content, &mentions).await;
+    let text = state.discord_text_for_slack(&converted).await;
+    crate::slack::update_on_slack(state, &slack_channel, &ts, &text).await?;
+    tracing::debug!(%slack_channel, %ts, "mirrored discord edit to slack");
+    Ok(())
+}
+
+/// A Discord message we relayed was deleted → delete the Slack copy.
+async fn handle_discord_delete(state: &AppState, message_id: MessageId) -> Result<()> {
+    let id = message_id.to_string();
+    let Some((slack_channel, ts, origin)) = state.db.slack_ref_for_discord_msg(&id).await? else {
+        return Ok(());
+    };
+    if origin != "discord" || ts.is_empty() {
+        return Ok(());
+    }
+    crate::slack::delete_on_slack(state, &slack_channel, &ts).await?;
+    state.db.delete_mapping_by_discord(&id).await?;
+    tracing::debug!(%slack_channel, %ts, "mirrored discord delete to slack");
+    Ok(())
+}
+
+static D_USER_MENTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"<@!?(\d+)>").unwrap());
+static D_ROLE_MENTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"<@&(\d+)>").unwrap());
+static D_CHANNEL_MENTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"<#(\d+)>").unwrap());
+
+/// Rewrite Discord user/role/channel mentions (raw ids) into something Slack
+/// shows meaningfully: `@Name`, `@role`, and `<#C…>` for mirrored channels.
+async fn discord_mentions_to_slack(
+    state: &AppState,
+    ctx: &SerenityContext,
+    content: &str,
+    mentions: &[User],
+) -> String {
+    let mut out = content.to_string();
+
+    for cap in D_USER_MENTION.captures_iter(content) {
+        let name = mentions
+            .iter()
+            .find(|u| u.id.to_string() == cap[1])
+            .map(|u| u.global_name.clone().unwrap_or_else(|| u.name.clone()))
+            .unwrap_or_else(|| "user".to_string());
+        out = out.replace(&cap[0], &format!("@{name}"));
+    }
+
+    if D_ROLE_MENTION.is_match(content) {
+        let roles = state.discord_guild.roles(&ctx.http).await.unwrap_or_default();
+        for cap in D_ROLE_MENTION.captures_iter(content) {
+            let name = cap[1]
+                .parse::<u64>()
+                .ok()
+                .and_then(|id| roles.get(&serenity::model::id::RoleId::new(id)))
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "role".to_string());
+            out = out.replace(&cap[0], &format!("@{name}"));
+        }
+    }
+
+    for cap in D_CHANNEL_MENTION.captures_iter(content) {
+        let replacement = match state.db.pair_by_discord(&cap[1]).await {
+            Ok(Some(pair)) => format!("<#{}>", pair.slack_channel_id),
+            _ => {
+                let name = match cap[1].parse::<u64>() {
+                    Ok(id) => match ChannelId::new(id).to_channel(&ctx.http).await {
+                        Ok(serenity::model::channel::Channel::Guild(gc)) => gc.name,
+                        _ => "channel".to_string(),
+                    },
+                    Err(_) => "channel".to_string(),
+                };
+                format!("#{name}")
+            }
+        };
+        out = out.replace(&cap[0], &replacement);
+    }
+    out
 }
 
 async fn handle_discord_message(
@@ -280,18 +455,59 @@ async fn handle_discord_message(
         .clone()
         .unwrap_or_else(|| msg.author.name.clone());
 
-    // Attachments: download from the Discord CDN and re-upload to Slack.
+    // Attachments: download from the Discord CDN and re-upload to Slack. Too
+    // large (or failed) ones are posted as a link line instead.
     let mut files = Vec::new();
+    let mut notices = Vec::new();
     for att in &msg.attachments {
+        if u64::from(att.size) > media::INLINE_LIMIT {
+            notices.push(format!(
+                "📎 <{}|{}> (too large to mirror, {})",
+                att.url, att.filename, media::human_size(Some(att.size.into()))
+            ));
+            continue;
+        }
         match media::download_discord_attachment(&state.http, &att.url, &att.filename).await {
-            Ok(f) => files.push(f),
-            Err(e) => tracing::warn!(error = ?e, "discord attachment download failed"),
+            Ok(media::Download::File(f)) => files.push(f),
+            Ok(media::Download::TooLarge(size)) => notices.push(format!(
+                "📎 <{}|{}> (too large to mirror, {})",
+                att.url, att.filename, media::human_size(size)
+            )),
+            Err(e) => {
+                tracing::warn!(error = ?e, "discord attachment download failed");
+                notices.push(format!("📎 <{}|{}> (couldn't be mirrored)", att.url, att.filename));
+            }
         }
     }
 
-    let text = state.discord_text_for_slack(&msg.content).await;
+    let converted = discord_mentions_to_slack(state, ctx, &msg.content, &msg.mentions).await;
+    let mut text = state.discord_text_for_slack(&converted).await;
+    // Stickers have no Slack equivalent: name them.
+    for sticker in &msg.sticker_items {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[sticker: {}]", sticker.name));
+    }
+    // Embed-only messages (no text): post the embed's link or title.
+    if text.trim().is_empty() {
+        for embed in &msg.embeds {
+            if let Some(line) = embed.url.clone().or_else(|| embed.title.clone()) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&line);
+            }
+        }
+    }
+    for notice in notices {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&notice);
+    }
     if text.trim().is_empty() && files.is_empty() {
-        tracing::debug!("discord message has no text or files (sticker/embed); skipping");
+        tracing::debug!("discord message has nothing to relay; skipping");
         return Ok(());
     }
     let username = state.config.slack_username(&author);

@@ -165,6 +165,59 @@ impl Db {
         .await?)
     }
 
+    /// (slack channel, slack ts, origin) for a mirrored Discord message.
+    pub async fn slack_ref_for_discord_msg(
+        &self,
+        discord_msg_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "SELECT slack_channel_id, slack_ts, origin FROM messages WHERE discord_msg_id = ?",
+        )
+        .bind(discord_msg_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn delete_mapping_by_discord(&self, discord_msg_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM messages WHERE discord_msg_id = ?")
+            .bind(discord_msg_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Forget a channel pairing and everything mapped under it (used when the
+    /// Discord channel was deleted and must be recreated).
+    pub async fn reset_channel(&self, slack_channel_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for table in ["messages", "threads", "channel_topics", "channel_pairs"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE slack_channel_id = ?"))
+                .bind(slack_channel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn stored_topic(&self, slack_channel_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT topic FROM channel_topics WHERE slack_channel_id = ?",
+        )
+        .bind(slack_channel_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn store_topic(&self, slack_channel_id: &str, topic: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO channel_topics (slack_channel_id, topic) VALUES (?, ?)")
+            .bind(slack_channel_id)
+            .bind(topic)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn discord_id_for_slack_ts(
         &self,
         slack_channel_id: &str,
@@ -274,6 +327,17 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?
         .flatten())
+    }
+
+    /// The Discord account linked to a Slack user through a shared alias.
+    pub async fn discord_id_for_slack_user(&self, slack_user_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT discord_user_id FROM user_aliases
+             WHERE slack_user_id = ? AND discord_user_id IS NOT NULL LIMIT 1",
+        )
+        .bind(slack_user_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn set_discord_alias(&self, alias: &str, discord_user_id: &str) -> Result<()> {

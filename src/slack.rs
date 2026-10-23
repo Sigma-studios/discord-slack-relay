@@ -1,5 +1,5 @@
-//! Slack side: Socket Mode listener (Slack→Discord + membership events) and
-//! the user-token poster (Discord→Slack).
+//! Slack side: Socket Mode listener (Slack→Discord, membership, channel and pin
+//! events) and the bot poster/editor (Discord→Slack).
 
 use std::sync::Arc;
 
@@ -81,6 +81,23 @@ pub async fn post_to_slack(
     Ok(String::new())
 }
 
+/// Edit a message our bot posted (mirror of a Discord edit).
+pub async fn update_on_slack(state: &AppState, channel_id: &str, ts: &str, text: &str) -> Result<()> {
+    let session = state.slack.open_session(&state.slack_bot_token);
+    let content = SlackMessageContent::new().with_text(text.to_string());
+    let req = SlackApiChatUpdateRequest::new(channel_id.into(), content, ts.into());
+    session.chat_update(&req).await.context("chat.update")?;
+    Ok(())
+}
+
+/// Delete a message our bot posted (mirror of a Discord delete).
+pub async fn delete_on_slack(state: &AppState, channel_id: &str, ts: &str) -> Result<()> {
+    let session = state.slack.open_session(&state.slack_bot_token);
+    let req = SlackApiChatDeleteRequest::new(channel_id.into(), ts.into());
+    session.chat_delete(&req).await.context("chat.delete")?;
+    Ok(())
+}
+
 /// Mirror an inbound Slack message into Discord.
 pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> Result<()> {
     let Some(channel) = ev.origin.channel.as_ref() else {
@@ -100,6 +117,9 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         }
         Some(SlackMessageEventType::MessageDeleted) => {
             return handle_slack_delete(state, &channel_id, ev).await;
+        }
+        Some(SlackMessageEventType::ChannelTopic) | Some(SlackMessageEventType::ChannelPurpose) => {
+            return refresh_topic(state, &channel_id).await;
         }
         Some(_) => return Ok(()),
     }
@@ -132,21 +152,43 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let profile = ev.sender.user_profile.as_ref();
     let sender_name = state.slack_display_name(&user_id, profile).await;
     let sender_avatar = state.slack_avatar(&user_id, profile).await;
-    let (discord_text, ping_everyone) = state.slack_text_for_discord(&text).await;
+    let (mut discord_text, ping_everyone) = state.slack_text_for_discord(&text).await;
 
-    // Files: download with the bot token, keep only those small enough inline.
+    // Files: download with the bot token and re-upload; ones too large (or
+    // unavailable) become a line linking back to Slack instead of vanishing.
     let mut files = Vec::new();
+    let mut notices = Vec::new();
     if let Some(fs) = content.and_then(|c| c.files.as_ref()) {
         for sf in fs {
-            let Some(url) = sf.url_private.as_ref() else { continue };
             let name = sf.name.clone().unwrap_or_else(|| "file".to_string());
+            let link = sf
+                .permalink
+                .as_ref()
+                .map(|u| format!("[{name}](<{u}>)"))
+                .unwrap_or_else(|| name.clone());
+            let Some(url) = sf.url_private.as_ref() else {
+                notices.push(format!("📎 {link} (not available to the relay)"));
+                continue;
+            };
             let token = token_value(&state.slack_bot_token);
             match media::download_slack_file(&state.http, url.as_str(), &name, &token).await {
-                Ok(f) if (f.bytes.len() as u64) <= media::INLINE_LIMIT => files.push(f),
-                Ok(_) => tracing::info!("slack file over inline limit; skipping upload"),
-                Err(e) => tracing::warn!(error = ?e, "slack file download failed"),
+                Ok(media::Download::File(f)) => files.push(f),
+                Ok(media::Download::TooLarge(size)) => notices.push(format!(
+                    "📎 {link} (too large to mirror, {}; open in Slack)",
+                    media::human_size(size)
+                )),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "slack file download failed");
+                    notices.push(format!("📎 {link} (couldn't be mirrored)"));
+                }
             }
         }
+    }
+    for notice in notices {
+        if !discord_text.is_empty() {
+            discord_text.push('\n');
+        }
+        discord_text.push_str(&notice);
     }
 
     // Thread handling: a reply (thread_ts present and != ts) goes into a Discord
@@ -162,31 +204,93 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         None => None,
     };
 
-    let discord_msg_id = crate::discord::post_to_discord(
+    let posted = post_with_recovery(
         state,
-        &pair,
+        pair,
         &sender_name,
         sender_avatar.as_deref(),
         &discord_text,
         discord_thread_id,
-        files,
+        &files,
         ping_everyone,
     )
     .await?;
 
-    let discord_thread = discord_thread_id.map(|t| t.to_string());
+    // "Also send to channel": Discord has no equivalent, so post a second copy
+    // in the main channel too (not mapped: edits/deletes follow the thread copy).
+    if matches!(ev.subtype, Some(SlackMessageEventType::ThreadBroadcast)) && posted.thread_id.is_some() {
+        let broadcast = format!("↪ *replied to a thread:*\n{discord_text}");
+        crate::discord::post_to_discord(
+            state,
+            &posted.pair,
+            &sender_name,
+            sender_avatar.as_deref(),
+            &broadcast,
+            None,
+            &files,
+            ping_everyone,
+        )
+        .await?;
+    }
+
+    let discord_thread = posted.thread_id.map(|t| t.to_string());
     state
         .db
         .map_message(
             &channel_id,
             &ts,
-            &discord_msg_id.to_string(),
+            &posted.message_id.to_string(),
             "slack",
             slack_thread_ts.as_deref(),
             discord_thread.as_deref(),
         )
         .await?;
     Ok(())
+}
+
+struct Posted {
+    pair: crate::db::ChannelPair,
+    message_id: u64,
+    thread_id: Option<u64>,
+}
+
+/// Post to Discord; if the mirrored channel (or its webhook) was deleted on
+/// Discord, recreate the mirror and post there instead (top-level: the old
+/// thread went away with the channel).
+#[allow(clippy::too_many_arguments)]
+async fn post_with_recovery(
+    state: &AppState,
+    pair: crate::db::ChannelPair,
+    sender_name: &str,
+    sender_avatar: Option<&str>,
+    text: &str,
+    thread_id: Option<u64>,
+    files: &[DownloadedFile],
+    ping_everyone: bool,
+) -> Result<Posted> {
+    let first = crate::discord::post_to_discord(
+        state, &pair, sender_name, sender_avatar, text, thread_id, files, ping_everyone,
+    )
+    .await;
+    match first {
+        Ok(message_id) => Ok(Posted { pair, message_id, thread_id }),
+        Err(e) if crate::discord::is_gone(&e) => {
+            tracing::warn!(slack_channel = %pair.slack_channel_id, "mirror channel was deleted on Discord; recreating it");
+            state.db.reset_channel(&pair.slack_channel_id).await?;
+            handle_bot_membership(state, &pair.slack_channel_id, true).await?;
+            let pair = state
+                .db
+                .pair_by_slack(&pair.slack_channel_id)
+                .await?
+                .context("mirror not recreated")?;
+            let message_id = crate::discord::post_to_discord(
+                state, &pair, sender_name, sender_avatar, text, None, files, ping_everyone,
+            )
+            .await?;
+            Ok(Posted { pair, message_id, thread_id: None })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn is_our_bot(state: &AppState, sender: &SlackMessageSender) -> bool {
@@ -287,9 +391,10 @@ pub async fn handle_bot_membership(state: &AppState, channel_id: &str, joined: b
         let session = state.slack.open_session(&state.slack_bot_token);
         let req = SlackApiConversationsInfoRequest::new(channel_id.into());
         let info = session.conversations_info(&req).await.context("conversations.info")?;
-        let name = info.channel.name.unwrap_or_else(|| channel_id.to_string());
+        let name = info.channel.name.clone().unwrap_or_else(|| channel_id.to_string());
         let is_private = info.channel.flags.is_private.unwrap_or(false);
         crate::discord::provision_channel(state, channel_id, &name, is_private).await?;
+        sync_topic(state, channel_id, &info.channel).await?;
     } else if let Some(pair) = state.db.pair_by_slack(channel_id).await? {
         crate::discord::archive_channel(state, &pair).await?;
     }
@@ -329,6 +434,9 @@ pub async fn reconcile_memberships(state: &AppState) -> Result<()> {
                     }
                 }
             }
+            if let Err(e) = sync_topic(state, &id, &ch).await {
+                tracing::warn!(channel = %id, error = ?e, "topic sync failed");
+            }
         }
         match resp.response_metadata.and_then(|m| m.next_cursor) {
             Some(c) if !c.to_string().is_empty() => cursor = Some(c),
@@ -336,6 +444,80 @@ pub async fn reconcile_memberships(state: &AppState) -> Result<()> {
         }
     }
     tracing::info!(provisioned, "reconciled slack channel memberships");
+    Ok(())
+}
+
+/// Mirror a Slack channel's topic (or its purpose when the topic is empty) as
+/// the Discord channel topic. Skips the edit when nothing changed: Discord
+/// rate-limits channel edits to a couple per 10 minutes.
+async fn sync_topic(state: &AppState, channel_id: &str, info: &SlackChannelInfo) -> Result<()> {
+    let non_empty = |d: &Option<SlackChannelDetails>| {
+        d.as_ref().map(|d| d.value.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let topic = non_empty(&info.topic)
+        .or_else(|| non_empty(&info.purpose))
+        .map(|t| crate::format::decode_entities(&t))
+        .unwrap_or_default();
+    let stored = state.db.stored_topic(channel_id).await?;
+    if stored.as_deref() == Some(topic.as_str()) || (stored.is_none() && topic.is_empty()) {
+        return Ok(());
+    }
+    let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
+    crate::discord::set_topic(state, &pair, &topic).await?;
+    state.db.store_topic(channel_id, &topic).await?;
+    Ok(())
+}
+
+async fn refresh_topic(state: &AppState, channel_id: &str) -> Result<()> {
+    let session = state.slack.open_session(&state.slack_bot_token);
+    let req = SlackApiConversationsInfoRequest::new(channel_id.into());
+    let info = session.conversations_info(&req).await.context("conversations.info")?;
+    sync_topic(state, channel_id, &info.channel).await
+}
+
+/// Events slack-morphism doesn't model (they arrive as raw JSON): private
+/// channel lifecycle (`group_*`) and pins.
+async fn handle_raw_event(state: &AppState, v: &serde_json::Value) -> Result<()> {
+    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+    // `channel` is an id string for most events, an object for renames.
+    let channel_id = v
+        .get("channel")
+        .and_then(|c| c.as_str().or_else(|| c.get("id").and_then(|i| i.as_str())))
+        .or_else(|| v.get("channel_id").and_then(|c| c.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    match kind {
+        "group_rename" => {
+            let name = v.pointer("/channel/name").and_then(|n| n.as_str());
+            if let (Some(pair), Some(name)) = (state.db.pair_by_slack(&channel_id).await?, name) {
+                crate::discord::rename_channel(state, &pair, name).await?;
+            }
+        }
+        "group_archive" => set_archived(state, &channel_id, true).await?,
+        "group_unarchive" => set_archived(state, &channel_id, false).await?,
+        "group_deleted" => archive_deleted(state, &channel_id).await?,
+        "pin_added" | "pin_removed" => {
+            let Some(ts) = v.pointer("/item/message/ts").and_then(|t| t.as_str()) else {
+                return Ok(()); // pinned file or other non-message item
+            };
+            let Some(row) = state.db.message_by_slack_ts(&channel_id, ts).await? else {
+                return Ok(());
+            };
+            let Some(pair) = state.db.pair_by_slack(&channel_id).await? else { return Ok(()) };
+            let thread_id = row.discord_thread_id.as_deref().map(str::parse).transpose()?;
+            crate::discord::set_pinned(state, &pair, row.discord_msg_id.parse()?, thread_id, kind == "pin_added")
+                .await?;
+        }
+        _ => tracing::trace!(%kind, "unhandled raw slack event"),
+    }
+    Ok(())
+}
+
+/// A Slack channel was deleted: stop mirroring and mark the Discord channel.
+async fn archive_deleted(state: &AppState, channel_id: &str) -> Result<()> {
+    if let Some(pair) = state.db.pair_by_slack(channel_id).await? {
+        crate::discord::archive_channel(state, &pair).await?;
+    }
     Ok(())
 }
 
@@ -411,6 +593,8 @@ async fn on_push_event(
                 Ok(())
             }
         }
+        SlackEventCallbackBody::ChannelDeleted(ev) => archive_deleted(&state, ev.channel.as_ref()).await,
+        SlackEventCallbackBody::Unknown(v) => handle_raw_event(&state, &v).await,
         other => {
             tracing::trace!(?other, "unhandled slack event");
             Ok(())
