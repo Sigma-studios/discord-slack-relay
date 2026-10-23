@@ -9,15 +9,58 @@ use once_cell::sync::Lazy;
 use slack_morphism::prelude::*;
 use tokio::sync::mpsc;
 
+use crate::db::DiscordMsgRef;
 use crate::media::{self, DownloadedFile};
 use crate::relay::AppState;
 
 type SlackHyperConnector = slack_morphism::prelude::SlackClientHyperHttpsConnector;
 
+/// Which Discord message an upload mirrors. Slack's upload API doesn't return
+/// the share message's ts, but the share arrives as our own `file_share` event;
+/// the link is registered under the file ids before sharing, so that event can
+/// complete the mapping (making the message editable and deletable later).
+#[derive(Clone)]
+pub struct UploadLink {
+    pub discord_msg_id: String,
+    pub slack_thread_ts: Option<String>,
+    pub discord_thread_id: Option<String>,
+}
+
+struct PendingUpload {
+    link: UploadLink,
+    file_ids: Vec<String>,
+    registered: std::time::Instant,
+}
+
+/// Uploads awaiting their share event, keyed by Slack file id.
+static PENDING_UPLOADS: Lazy<Mutex<HashMap<String, Arc<PendingUpload>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn register_upload(link: UploadLink, file_ids: Vec<String>) {
+    let pending = Arc::new(PendingUpload { link, file_ids: file_ids.clone(), registered: std::time::Instant::now() });
+    let mut map = PENDING_UPLOADS.lock().expect("pending uploads lock poisoned");
+    // Drop entries whose share event never came.
+    map.retain(|_, p| p.registered.elapsed() < std::time::Duration::from_secs(600));
+    for id in file_ids {
+        map.insert(id, pending.clone());
+    }
+}
+
+fn claim_upload(file_ids: &[String]) -> Option<Arc<PendingUpload>> {
+    let mut map = PENDING_UPLOADS.lock().expect("pending uploads lock poisoned");
+    let pending = file_ids.iter().find_map(|id| map.get(id).cloned())?;
+    for id in &pending.file_ids {
+        map.remove(id);
+    }
+    Some(pending)
+}
+
 /// Post a relayed Discord message into Slack as the bot, shown under the
 /// Discord sender's name and avatar (`chat:write.customize`). `thread_ts` set →
 /// threaded reply. `files` non-empty → external upload flow with the text as
-/// the initial comment. Returns the Slack ts (empty for uploads).
+/// the initial comment. Returns the Slack ts (empty for uploads, which are
+/// mapped later through `link`).
+#[allow(clippy::too_many_arguments)]
 pub async fn post_to_slack(
     state: &AppState,
     slack_channel_id: &str,
@@ -26,6 +69,7 @@ pub async fn post_to_slack(
     icon_url: Option<String>,
     thread_ts: Option<String>,
     files: Vec<DownloadedFile>,
+    link: Option<UploadLink>,
 ) -> Result<String> {
     let session = state.slack.open_session(&state.slack_bot_token);
 
@@ -50,6 +94,7 @@ pub async fn post_to_slack(
 
     // External upload flow: get url → PUT bytes → complete (shares to channel).
     let mut completed = Vec::new();
+    let mut file_ids = Vec::new();
     for f in files {
         let get = SlackApiFilesGetUploadUrlExternalRequest::new(f.filename.clone(), f.bytes.len());
         let got = session
@@ -65,7 +110,13 @@ pub async fn post_to_slack(
             .files_upload_via_url(&via)
             .await
             .context("files upload via url")?;
+        file_ids.push(got.file_id.to_string());
         completed.push(SlackApiFilesComplete::new(got.file_id));
+    }
+    // Register before completing: the share event can arrive before the
+    // completion call returns.
+    if let Some(link) = link {
+        register_upload(link, file_ids);
     }
 
     let mut complete = SlackApiFilesCompleteUploadExternalRequest::new(completed)
@@ -80,8 +131,45 @@ pub async fn post_to_slack(
         .await
         .context("files.completeUploadExternal")?;
 
-    // The share message's ts isn't returned; its echo is dropped by bot_id.
+    // The share message's ts isn't returned; our share event maps it.
     Ok(String::new())
+}
+
+/// Our own `file_share` event: link it to the Discord message it mirrors.
+async fn link_own_upload(state: &AppState, channel_id: &str, ts: &str, ev: &SlackMessageEvent) -> Result<()> {
+    let ids: Vec<String> = ev
+        .content
+        .as_ref()
+        .and_then(|c| c.files.as_ref())
+        .map(|fs| fs.iter().map(|f| f.id.to_string()).collect())
+        .unwrap_or_default();
+    let Some(pending) = claim_upload(&ids) else { return Ok(()) };
+    state
+        .db
+        .map_message(
+            channel_id,
+            ts,
+            &pending.link.discord_msg_id,
+            "discord",
+            pending.link.slack_thread_ts.as_deref(),
+            pending.link.discord_thread_id.as_deref(),
+        )
+        .await?;
+    state.db.set_slack_file_ids(channel_id, ts, &pending.file_ids).await?;
+    tracing::debug!(%channel_id, %ts, "linked uploaded files to their discord message");
+    Ok(())
+}
+
+/// Delete files our bot uploaded (mirror of deleting the Discord message).
+/// Best effort: a file already gone is fine.
+pub async fn delete_files_on_slack(state: &AppState, file_ids: &[String]) {
+    let session = state.slack.open_session(&state.slack_bot_token);
+    for id in file_ids {
+        let req = SlackApiFilesDeleteRequest::new(id.clone().into());
+        if let Err(e) = session.files_delete(&req).await {
+            tracing::debug!(file = %id, error = ?e, "slack file delete failed");
+        }
+    }
 }
 
 /// Edit a message our bot posted (mirror of a Discord edit).
@@ -128,7 +216,14 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     }
 
     // Loop prevention: anything our own bot posted (relayed Discord messages).
-    if is_our_bot(state, &ev.sender) || state.db.is_self_posted(&ts).await? {
+    // Our own file shares are only used to learn the ts of an upload.
+    if is_our_bot(state, &ev.sender) {
+        if matches!(ev.subtype, Some(SlackMessageEventType::FileShare)) {
+            return link_own_upload(state, &channel_id, &ts, ev).await;
+        }
+        return Ok(());
+    }
+    if state.db.is_self_posted(&ts).await? {
         return Ok(());
     }
     // Already mirrored (a redelivered event, e.g. after a restart).
@@ -225,15 +320,15 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     .await?;
 
     // "Also send to channel": Discord has no equivalent, so post a second copy
-    // in the main channel too (not mapped: edits/deletes follow the thread copy).
+    // in the main channel too; it's recorded so edits and deletes follow it.
+    let mut broadcast_ids = Vec::new();
     if matches!(ev.subtype, Some(SlackMessageEventType::ThreadBroadcast)) && posted.thread_id.is_some() {
-        let broadcast = format!("↪ *replied to a thread:*\n{discord_text}");
-        crate::discord::post_to_discord(
+        broadcast_ids = crate::discord::post_to_discord(
             state,
             &posted.pair,
             &sender_name,
             sender_avatar.as_deref(),
-            &broadcast,
+            &broadcast_text(&discord_text),
             None,
             &files,
             ping_everyone,
@@ -241,7 +336,7 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         .await?;
     }
 
-    tracing::debug!(%channel_id, %ts, files = files.len(), "relayed slack message to discord");
+    tracing::debug!(%channel_id, %ts, files = files.len(), parts = posted.message_ids.len(), "relayed slack message to discord");
 
     let discord_thread = posted.thread_id.map(|t| t.to_string());
     state
@@ -249,18 +344,36 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         .map_message(
             &channel_id,
             &ts,
-            &posted.message_id.to_string(),
+            &posted.message_ids[0].to_string(),
             "slack",
             slack_thread_ts.as_deref(),
             discord_thread.as_deref(),
         )
         .await?;
+    let in_thread = |id: &u64| DiscordMsgRef { message_id: *id, thread_id: posted.thread_id };
+    let parts: Vec<DiscordMsgRef> = posted.message_ids[1..].iter().map(in_thread).collect();
+    state.db.set_extras(&channel_id, &ts, ROLE_PART, &parts).await?;
+    let broadcast: Vec<DiscordMsgRef> = broadcast_ids
+        .iter()
+        .map(|id| DiscordMsgRef { message_id: *id, thread_id: None })
+        .collect();
+    state.db.set_extras(&channel_id, &ts, ROLE_BROADCAST, &broadcast).await?;
     Ok(())
+}
+
+/// Extra-message roles (see migration 0004).
+const ROLE_PART: &str = "part";
+const ROLE_BROADCAST: &str = "broadcast";
+
+/// Text of the main-channel copy of an "also send to channel" reply.
+fn broadcast_text(discord_text: &str) -> String {
+    format!("↪ *replied to a thread:*\n{discord_text}")
 }
 
 struct Posted {
     pair: crate::db::ChannelPair,
-    message_id: u64,
+    /// One id per part (several when the text was split for Discord).
+    message_ids: Vec<u64>,
     thread_id: Option<u64>,
 }
 
@@ -283,7 +396,7 @@ async fn post_with_recovery(
     )
     .await;
     match first {
-        Ok(message_id) => Ok(Posted { pair, message_id, thread_id }),
+        Ok(message_ids) => Ok(Posted { pair, message_ids, thread_id }),
         Err(e) if crate::discord::is_gone(&e) => {
             tracing::warn!(slack_channel = %pair.slack_channel_id, "mirror channel was deleted on Discord; recreating it");
             state.db.reset_channel(&pair.slack_channel_id).await?;
@@ -293,11 +406,11 @@ async fn post_with_recovery(
                 .pair_by_slack(&pair.slack_channel_id)
                 .await?
                 .context("mirror not recreated")?;
-            let message_id = crate::discord::post_to_discord(
+            let message_ids = crate::discord::post_to_discord(
                 state, &pair, sender_name, sender_avatar, text, None, files, ping_everyone,
             )
             .await?;
-            Ok(Posted { pair, message_id, thread_id: None })
+            Ok(Posted { pair, message_ids, thread_id: None })
         }
         Err(e) => Err(e),
     }
@@ -336,11 +449,28 @@ async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessage
     let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
 
     let (content, _) = state.slack_text_for_discord(&text).await;
-    let thread_id = row.discord_thread_id.as_deref().map(str::parse).transpose()?;
-    crate::discord::edit_on_discord(state, &pair, row.discord_msg_id.parse()?, thread_id, &content)
-        .await?;
+
+    // Every part of the mirrored message (it may have been split), in order.
+    let mut parts = vec![primary_ref(&row)?];
+    parts.extend(state.db.extras(channel_id, &ts, ROLE_PART).await?);
+    let kept = crate::discord::sync_edit(state, &pair, &parts, &content).await?;
+    state.db.set_extras(channel_id, &ts, ROLE_PART, &kept[1..]).await?;
+
+    // The main-channel copy of an "also send to channel" reply follows too.
+    let broadcast = state.db.extras(channel_id, &ts, ROLE_BROADCAST).await?;
+    if !broadcast.is_empty() {
+        let kept = crate::discord::sync_edit(state, &pair, &broadcast, &broadcast_text(&content)).await?;
+        state.db.set_extras(channel_id, &ts, ROLE_BROADCAST, &kept).await?;
+    }
     tracing::debug!(%channel_id, %ts, "mirrored slack edit to discord");
     Ok(())
+}
+
+fn primary_ref(row: &crate::db::MessageRow) -> Result<DiscordMsgRef> {
+    Ok(DiscordMsgRef {
+        message_id: row.discord_msg_id.parse()?,
+        thread_id: row.discord_thread_id.as_deref().map(str::parse).transpose()?,
+    })
 }
 
 /// A Slack message was deleted → delete its Discord mirror.
@@ -361,8 +491,13 @@ async fn handle_slack_delete(state: &AppState, channel_id: &str, ev: &SlackMessa
     }
     let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
 
-    let thread_id = row.discord_thread_id.as_deref().map(str::parse).transpose()?;
-    crate::discord::delete_on_discord(state, &pair, row.discord_msg_id.parse()?, thread_id).await?;
+    // The message, its extra parts and its main-channel copy all go.
+    let mut all = vec![primary_ref(&row)?];
+    all.extend(state.db.extras(channel_id, &ts, ROLE_PART).await?);
+    all.extend(state.db.extras(channel_id, &ts, ROLE_BROADCAST).await?);
+    for part in all {
+        crate::discord::delete_on_discord(state, &pair, part.message_id, part.thread_id).await?;
+    }
     state.db.delete_message_mapping(channel_id, &ts).await?;
     tracing::debug!(%channel_id, %ts, "mirrored slack delete to discord");
     Ok(())
@@ -709,6 +844,21 @@ mod tests {
         assert!(first_sighting("Ev-test-1"));
         assert!(!first_sighting("Ev-test-1"));
         assert!(first_sighting("Ev-test-2"));
+    }
+
+    #[test]
+    fn upload_share_claims_its_discord_message_once() {
+        let link = UploadLink {
+            discord_msg_id: "111".into(),
+            slack_thread_ts: None,
+            discord_thread_id: None,
+        };
+        register_upload(link, vec!["F-a".into(), "F-b".into()]);
+        // The share event lists any of the files; all of them are released.
+        let claimed = claim_upload(&["F-b".into()]).expect("pending upload");
+        assert_eq!(claimed.link.discord_msg_id, "111");
+        assert!(claim_upload(&["F-a".into()]).is_none());
+        assert!(claim_upload(&["F-unknown".into()]).is_none());
     }
 
     #[test]

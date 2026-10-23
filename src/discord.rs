@@ -18,7 +18,7 @@ use serenity::prelude::{Context as SerenityContext, EventHandler};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::db::ChannelPair;
+use crate::db::{ChannelPair, DiscordMsgRef};
 use crate::media;
 use crate::relay::AppState;
 
@@ -88,7 +88,8 @@ pub async fn archive_channel(state: &AppState, pair: &ChannelPair) -> Result<()>
 }
 
 /// Post a Slack message into the paired Discord channel via its webhook, using
-/// the Slack sender's name and avatar. Returns the created Discord message id.
+/// the Slack sender's name and avatar. Returns the created Discord message ids:
+/// one per part when the text had to be split.
 #[allow(clippy::too_many_arguments)]
 pub async fn post_to_discord(
     state: &AppState,
@@ -99,17 +100,17 @@ pub async fn post_to_discord(
     thread_id: Option<u64>,
     files: &[media::DownloadedFile],
     ping_everyone: bool,
-) -> Result<u64> {
+) -> Result<Vec<u64>> {
     let webhook = pair_webhook(state, pair).await?;
 
     // Users may be pinged (alias tags); @everyone only when the Slack message
     // pinged our bot, so a literal "@everyone" from Slack can't mass-ping.
     let mentions = CreateAllowedMentions::new().all_users(true).everyone(ping_everyone);
     // Discord caps messages at 2000 chars: post long text as several messages,
-    // files on the last one. The first message is the one mapped for edits.
+    // files on the last one.
     let chunks = crate::format::split_for_discord(content, crate::format::DISCORD_MAX_CHARS);
     let last = chunks.len() - 1;
-    let mut first_id = None;
+    let mut ids = Vec::with_capacity(chunks.len());
     for (i, chunk) in chunks.iter().enumerate() {
         let mut builder = ExecuteWebhook::new()
             .username(sender_name)
@@ -131,9 +132,37 @@ pub async fn post_to_discord(
             .execute(&state.discord, true, builder)
             .await?
             .context("webhook execute returned no message (need wait=true)")?;
-        first_id.get_or_insert(msg.id.get());
+        ids.push(msg.id.get());
     }
-    first_id.context("nothing posted")
+    Ok(ids)
+}
+
+/// Apply an edited text to the Discord messages that mirror one Slack message
+/// (its split parts, in order): edit each part, delete parts the shorter text
+/// no longer needs, and fold any overflow into the last part (truncated: a
+/// part can't be inserted between existing messages). Returns the parts kept.
+pub async fn sync_edit(
+    state: &AppState,
+    pair: &ChannelPair,
+    parts: &[DiscordMsgRef],
+    text: &str,
+) -> Result<Vec<DiscordMsgRef>> {
+    let chunks = crate::format::split_for_discord(text, crate::format::DISCORD_MAX_CHARS);
+    let mut kept = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i < chunks.len() {
+            let content = if i + 1 == parts.len() && chunks.len() > parts.len() {
+                chunks[i..].join("\n")
+            } else {
+                chunks[i].clone()
+            };
+            edit_on_discord(state, pair, part.message_id, part.thread_id, &content).await?;
+            kept.push(*part);
+        } else {
+            delete_on_discord(state, pair, part.message_id, part.thread_id).await?;
+        }
+    }
+    Ok(kept)
 }
 
 async fn pair_webhook(state: &AppState, pair: &ChannelPair) -> Result<Webhook> {
@@ -180,11 +209,15 @@ pub async fn delete_on_discord(
     thread_id: Option<u64>,
 ) -> Result<()> {
     let webhook = pair_webhook(state, pair).await?;
-    webhook
+    let result = webhook
         .delete_message(&state.discord, thread_id.map(ChannelId::new), MessageId::new(message_id))
         .await
-        .context("delete webhook message")?;
-    Ok(())
+        .context("delete webhook message");
+    match result {
+        // Already gone (deleted by hand on Discord): nothing left to do.
+        Err(e) if has_discord_code(&e, &[10008]) => Ok(()),
+        other => other,
+    }
 }
 
 /// Set the Discord channel topic (Discord caps topics at 1024 chars).
@@ -221,11 +254,16 @@ pub async fn set_pinned(
 /// True when Discord says the mirrored channel or its webhook no longer exists
 /// (someone deleted the channel), so the pairing must be recreated.
 pub fn is_gone(err: &anyhow::Error) -> bool {
+    has_discord_code(err, &[10003, 10015])
+}
+
+/// Whether a Discord API error with one of these JSON error codes is in the chain.
+fn has_discord_code(err: &anyhow::Error, codes: &[isize]) -> bool {
     err.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<serenity::Error>(),
             Some(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
-                if matches!(r.error.code, 10003 | 10015)
+                if codes.contains(&r.error.code)
         )
     })
 }
@@ -348,6 +386,8 @@ async fn handle_discord_delete(state: &AppState, message_id: MessageId) -> Resul
     if origin != "discord" || ts.is_empty() {
         return Ok(());
     }
+    let file_ids = state.db.slack_file_ids_for_discord_msg(&id).await?;
+    crate::slack::delete_files_on_slack(state, &file_ids).await;
     crate::slack::delete_on_slack(state, &slack_channel, &ts).await?;
     state.db.delete_mapping_by_discord(&id).await?;
     tracing::debug!(%slack_channel, %ts, "mirrored discord delete to slack");
@@ -547,6 +587,14 @@ async fn handle_discord_message(
         return Ok(());
     }
     let username = state.config.slack_username(&author);
+    let discord_thread = in_discord_thread.then(|| this_channel.to_string());
+    // For uploads Slack doesn't return the message ts; the share event that
+    // follows carries it, and `link` lets that event complete the mapping.
+    let link = crate::slack::UploadLink {
+        discord_msg_id: msg.id.to_string(),
+        slack_thread_ts: slack_thread_ts.clone(),
+        discord_thread_id: discord_thread.clone(),
+    };
     let slack_ts = crate::slack::post_to_slack(
         state,
         &pair.slack_channel_id,
@@ -555,23 +603,25 @@ async fn handle_discord_message(
         Some(msg.author.face()),
         slack_thread_ts.clone(),
         files,
+        Some(link),
     )
     .await?;
 
     tracing::debug!(slack_channel = %pair.slack_channel_id, %slack_ts, "relayed discord message to slack");
 
-    let discord_thread = in_discord_thread.then(|| this_channel.to_string());
-    state
-        .db
-        .map_message(
-            &pair.slack_channel_id,
-            &slack_ts,
-            &msg.id.to_string(),
-            "discord",
-            slack_thread_ts.as_deref(),
-            discord_thread.as_deref(),
-        )
-        .await?;
+    if !slack_ts.is_empty() {
+        state
+            .db
+            .map_message(
+                &pair.slack_channel_id,
+                &slack_ts,
+                &msg.id.to_string(),
+                "discord",
+                slack_thread_ts.as_deref(),
+                discord_thread.as_deref(),
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -638,6 +688,7 @@ async fn resolve_target(
         None,
         None,
         Vec::new(),
+        None,
     )
     .await?;
     state

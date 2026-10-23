@@ -22,6 +22,13 @@ pub struct MessageRow {
     pub discord_thread_id: Option<String>,
 }
 
+/// One Discord message (and the thread it lives in, if any).
+#[derive(Debug, Clone, Copy)]
+pub struct DiscordMsgRef {
+    pub message_id: u64,
+    pub thread_id: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct Db {
     pub pool: SqlitePool,
@@ -145,11 +152,13 @@ impl Db {
     }
 
     pub async fn delete_message_mapping(&self, slack_channel_id: &str, slack_ts: &str) -> Result<()> {
-        sqlx::query("DELETE FROM messages WHERE slack_channel_id = ? AND slack_ts = ?")
-            .bind(slack_channel_id)
-            .bind(slack_ts)
-            .execute(&self.pool)
-            .await?;
+        for table in ["messages", "message_extras"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE slack_channel_id = ? AND slack_ts = ?"))
+                .bind(slack_channel_id)
+                .bind(slack_ts)
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -190,7 +199,7 @@ impl Db {
     /// Discord channel was deleted and must be recreated).
     pub async fn reset_channel(&self, slack_channel_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        for table in ["messages", "threads", "channel_topics", "channel_pairs"] {
+        for table in ["messages", "message_extras", "threads", "channel_topics", "channel_pairs"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE slack_channel_id = ?"))
                 .bind(slack_channel_id)
                 .execute(&mut *tx)
@@ -216,6 +225,84 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Record extra Discord messages mirroring a Slack message (`role` is
+    /// 'part' or 'broadcast'), replacing any previous set for that role.
+    pub async fn set_extras(
+        &self,
+        slack_channel_id: &str,
+        slack_ts: &str,
+        role: &str,
+        extras: &[DiscordMsgRef],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM message_extras WHERE slack_channel_id = ? AND slack_ts = ? AND role = ?")
+            .bind(slack_channel_id)
+            .bind(slack_ts)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?;
+        for (idx, extra) in extras.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO message_extras
+                    (slack_channel_id, slack_ts, role, idx, discord_msg_id, discord_thread_id)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(slack_channel_id)
+            .bind(slack_ts)
+            .bind(role)
+            .bind(idx as i64)
+            .bind(extra.message_id.to_string())
+            .bind(extra.thread_id.map(|t| t.to_string()))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn extras(&self, slack_channel_id: &str, slack_ts: &str, role: &str) -> Result<Vec<DiscordMsgRef>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT discord_msg_id, discord_thread_id FROM message_extras
+             WHERE slack_channel_id = ? AND slack_ts = ? AND role = ? ORDER BY idx",
+        )
+        .bind(slack_channel_id)
+        .bind(slack_ts)
+        .bind(role)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, thread)| {
+                Ok(DiscordMsgRef {
+                    message_id: id.parse()?,
+                    thread_id: thread.map(|t| t.parse()).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn set_slack_file_ids(&self, slack_channel_id: &str, slack_ts: &str, file_ids: &[String]) -> Result<()> {
+        sqlx::query("UPDATE messages SET slack_file_ids = ? WHERE slack_channel_id = ? AND slack_ts = ?")
+            .bind(file_ids.join(","))
+            .bind(slack_channel_id)
+            .bind(slack_ts)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Slack file ids uploaded for a Discord message (empty if none).
+    pub async fn slack_file_ids_for_discord_msg(&self, discord_msg_id: &str) -> Result<Vec<String>> {
+        let ids = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT slack_file_ids FROM messages WHERE discord_msg_id = ?",
+        )
+        .bind(discord_msg_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten()
+        .unwrap_or_default();
+        Ok(ids.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
     }
 
     pub async fn discord_id_for_slack_ts(
