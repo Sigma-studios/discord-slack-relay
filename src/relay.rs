@@ -27,12 +27,11 @@ pub struct AppState {
     pub discord_guild: serenity::model::id::GuildId,
     pub slack: Arc<SlackHyperClient>,
     pub slack_bot_token: SlackApiToken,
-    pub slack_user_token: SlackApiToken,
     /// The bot's own Slack user id, so we recognise our bot joining a channel.
     pub bot_user_id: String,
-    /// Matches text the relay itself posted into Slack (the credit line),
-    /// so those messages are not mirrored back to Discord.
-    pub credit_re: Arc<Regex>,
+    /// The bot's Slack bot id; messages carrying it were posted by the relay
+    /// and are never mirrored back to Discord.
+    pub bot_id: String,
 }
 
 // ── mention rewriting ────────────────────────────────────────────────────────
@@ -42,14 +41,6 @@ static SLACK_CHANNEL_REF: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"<#C[A-Z0-9]+\|([^>]+)>").unwrap());
 static DISCORD_TO_SLACK_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"@s:([A-Za-z0-9_.-]+)").unwrap());
 static SLACK_TO_DISCORD_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"@d:([A-Za-z0-9_.-]+)").unwrap());
-
-/// Build a regex that matches the rendered credit line for any sender name.
-pub fn build_credit_regex(template: &str) -> Regex {
-    // Escape the template, then turn the escaped `{name}` placeholder into `.+?`.
-    let escaped = regex::escape(template.trim());
-    let pattern = escaped.replace(r"\{name\}", ".+?");
-    Regex::new(&pattern).unwrap_or_else(|_| Regex::new(r"\A\z").unwrap())
-}
 
 impl AppState {
     /// Resolve a Slack user id to a display name, calling users.info if needed.
@@ -119,21 +110,15 @@ impl AppState {
         format::slack_to_discord(&out)
     }
 
-    /// Prepare Discord message text for posting into Slack, with the credit line.
-    pub async fn discord_text_for_slack(&self, raw: &str, author_name: &str) -> String {
+    /// Prepare Discord message text for posting into Slack.
+    pub async fn discord_text_for_slack(&self, raw: &str) -> String {
         let mut out = raw.to_string();
         for cap in DISCORD_TO_SLACK_TAG.captures_iter(raw) {
             if let Ok(Some(id)) = self.db.slack_id_for_alias(&cap[1]).await {
                 out = out.replace(&cap[0], &format!("<@{id}>"));
             }
         }
-        let converted = format::discord_to_slack(&out);
-        format!("{converted}{}", self.config.credit_line(author_name))
-    }
-
-    /// True if this inbound Slack text was posted by the relay (credit line).
-    pub fn is_relay_origin(&self, text: &str) -> bool {
-        self.credit_re.is_match(text)
+        format::discord_to_slack(&out)
     }
 
     pub async fn heartbeat(&self) -> Result<()> {

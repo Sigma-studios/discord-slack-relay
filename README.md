@@ -8,8 +8,8 @@ mirroring stops.
 - **Slack → Discord**: real-time via Socket Mode. Each Slack sender appears in
   Discord under their own name/avatar (posted through a per-channel webhook).
   Threads become Discord threads; media is re-uploaded (link fallback > ~19 MB).
-- **Discord → Slack**: posted **as you** (user token) with a credit line, e.g.
-  `_— alice via Discord_`.
+- **Discord → Slack**: posted by the bot under the Discord sender's name and
+  avatar (e.g. `alice (Discord)`), carrying the app's APP badge.
 - **Tagging**: `@d:alias` in Slack pings a Discord user; `@s:alias` in Discord
   pings a Slack user. Register aliases from Discord:
   - `!alias <name>` — map `<name>` to your Discord account
@@ -23,10 +23,9 @@ Fully wired and building against slack-morphism 2.31 / serenity 0.12:
   channel_archive/unarchive.
 - Slack→Discord: name + avatar via the event profile (users.info fallback),
   thread mirroring, inline media re-upload (≤ ~19 MB), mention/markup rewrite.
-- Discord→Slack: posts as you with the credit line, thread replies, attachment
-  re-upload via Slack's external-upload flow, alias pings.
-- Loop prevention: self-posted ts registry **and** a credit-line regex guard
-  (covers file uploads whose ts isn't returned).
+- Discord→Slack: posts via the bot under the sender's name/avatar, thread
+  replies, attachment re-upload via Slack's external-upload flow, alias pings.
+- Loop prevention: the relay's own posts are dropped by their Slack bot id.
 
 Not yet implemented (intentionally): edit/delete propagation, reactions, DMs,
 history backfill. `cargo test` covers the markup conversions.
@@ -41,12 +40,15 @@ out runtime issues (intents, scope gaps, thread edge cases) during setup.
 2. **Socket Mode**: enable it; create an app-level token with `connections:write`
    → `SLACK_APP_TOKEN`.
 3. **Bot token scopes**: `channels:history`, `groups:history`, `channels:read`,
-   `groups:read`, `users:read`, `files:read`. Install → `SLACK_BOT_TOKEN`.
-4. **User token scopes**: `chat:write`, `files:write`. Install → `SLACK_USER_TOKEN`.
-5. **Event subscriptions**: `message.channels`, `message.groups`,
+   `groups:read`, `users:read`, `files:read`, `chat:write`,
+   `chat:write.customize`, `files:write`. Install → `SLACK_BOT_TOKEN`.
+4. **Event subscriptions** (bot events): `message.channels`, `message.groups`,
    `member_joined_channel`, `member_left_channel`, `channel_rename`,
    `channel_archive`, `channel_unarchive`.
-6. Invite the bot to a channel: `/invite @yourbot`.
+5. Invite the bot to a channel: `/invite @yourbot`.
+
+Tip: the **App Manifest** page sets all of the above (scopes, Socket Mode,
+events) in one save — see `deploy/manifest.yaml`.
 
 ## Discord setup
 
@@ -69,7 +71,7 @@ cargo run
 ```sh
 facade app create relay --git <this-repo> --volume data:/data
 # set secrets (encrypted by default):
-facade env set relay SLACK_BOT_TOKEN=... SLACK_APP_TOKEN=... SLACK_USER_TOKEN=... \
+facade env set relay SLACK_BOT_TOKEN=... SLACK_APP_TOKEN=... \
   DISCORD_BOT_TOKEN=... DISCORD_GUILD_ID=... DATABASE_URL='sqlite:///data/relay.db?mode=rwc'
 facade deploy relay
 ```

@@ -11,29 +11,35 @@ use crate::relay::AppState;
 
 type SlackHyperConnector = slack_morphism::prelude::SlackClientHyperHttpsConnector;
 
-/// Post a message into Slack **as the user** (user token). `thread_ts` set →
+/// Post a relayed Discord message into Slack as the bot, shown under the
+/// Discord sender's name and avatar (`chat:write.customize`). `thread_ts` set →
 /// threaded reply. `files` non-empty → external upload flow with the text as
-/// the initial comment. Returns the Slack ts (best effort for uploads).
+/// the initial comment. Returns the Slack ts (empty for uploads).
 pub async fn post_to_slack(
     state: &AppState,
     slack_channel_id: &str,
     text: &str,
+    username: &str,
+    icon_url: Option<String>,
     thread_ts: Option<String>,
     files: Vec<DownloadedFile>,
 ) -> Result<String> {
-    let session = state.slack.open_session(&state.slack_user_token);
+    let session = state.slack.open_session(&state.slack_bot_token);
 
     if files.is_empty() {
         let content = SlackMessageContent::new().with_text(text.to_string());
-        let mut req =
-            SlackApiChatPostMessageRequest::new(slack_channel_id.into(), content);
+        let mut req = SlackApiChatPostMessageRequest::new(slack_channel_id.into(), content)
+            .with_username(username.to_string());
+        if let Some(url) = icon_url {
+            req = req.with_icon_url(url);
+        }
         if let Some(tts) = thread_ts {
             req = req.with_thread_ts(tts.into());
         }
         let resp = session
             .chat_post_message(&req)
             .await
-            .context("chat.postMessage as user")?;
+            .context("chat.postMessage")?;
         let ts = resp.ts.to_string();
         state.db.mark_self_posted(&ts).await?;
         return Ok(ts);
@@ -61,7 +67,8 @@ pub async fn post_to_slack(
 
     let mut complete = SlackApiFilesCompleteUploadExternalRequest::new(completed)
         .with_channel_id(slack_channel_id.into())
-        .with_initial_comment(text.to_string());
+        .with_initial_comment(text.to_string())
+        .with_username(username.to_string());
     if let Some(tts) = thread_ts {
         complete = complete.with_thread_ts(tts.into());
     }
@@ -70,8 +77,7 @@ pub async fn post_to_slack(
         .await
         .context("files.completeUploadExternal")?;
 
-    // The upload's share message ts isn't returned directly; the credit line in
-    // `text` is what stops the echo being mirrored back (see is_relay_origin).
+    // The share message's ts isn't returned; its echo is dropped by bot_id.
     Ok(String::new())
 }
 
@@ -83,22 +89,24 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let channel_id = channel.to_string();
     let ts = ev.origin.ts.to_string();
 
-    // Only mirror plain user messages; skip edits/deletes/joins/bot noise here.
-    if ev.subtype.is_some() {
+    // Mirror plain messages, file shares and thread broadcasts; skip edits,
+    // deletes, joins and other system subtypes.
+    match &ev.subtype {
+        None
+        | Some(SlackMessageEventType::FileShare)
+        | Some(SlackMessageEventType::ThreadBroadcast) => {}
+        Some(_) => return Ok(()),
+    }
+
+    // Loop prevention: anything our own bot posted (relayed Discord messages).
+    let from_our_bot = ev.sender.bot_id.as_ref().map(|b| b.to_string()) == Some(state.bot_id.clone())
+        || ev.sender.user.as_ref().map(|u| u.to_string()) == Some(state.bot_user_id.clone());
+    if from_our_bot || state.db.is_self_posted(&ts).await? {
         return Ok(());
     }
+
     let content = ev.content.as_ref();
     let text = content.and_then(|c| c.text.clone()).unwrap_or_default();
-
-    // Loop prevention: our own user-token posts (by ts) and any text carrying
-    // the relay credit line (covers file uploads whose ts we never captured).
-    if state.db.is_self_posted(&ts).await? || state.is_relay_origin(&text) {
-        return Ok(());
-    }
-    // Ignore messages authored by our own bot user.
-    if ev.sender.user.as_ref().map(|u| u.to_string()) == Some(state.bot_user_id.clone()) {
-        return Ok(());
-    }
 
     let Some(pair) = state.db.pair_by_slack(&channel_id).await? else {
         return Ok(());

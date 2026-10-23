@@ -36,16 +36,16 @@ async fn main() -> Result<()> {
     // Slack: one shared client; sessions are opened per-call with each token.
     let slack_client = Arc::new(SlackClient::new(SlackClientHyperConnector::new()?));
     let slack_bot_token = SlackApiToken::new(config.slack_bot_token.clone().into());
-    let slack_user_token = SlackApiToken::new(config.slack_user_token.clone().into());
 
-    // Identify our own bot user id, so we recognise the bot joining a channel.
-    let bot_user_id = {
+    // Identify our own bot: user id (to spot it joining channels) and bot id
+    // (to drop its own posts when they echo back as events).
+    let (bot_user_id, bot_id) = {
         let session = slack_client.open_session(&slack_bot_token);
-        session.auth_test().await?.user_id.to_string()
+        let me = session.auth_test().await?;
+        let bot_id = me.bot_id.map(|b| b.to_string()).unwrap_or_default();
+        (me.user_id.to_string(), bot_id)
     };
-    tracing::info!(%bot_user_id, "slack bot identity resolved");
-
-    let credit_re = Arc::new(relay::build_credit_regex(&config.credit_template));
+    tracing::info!(%bot_user_id, %bot_id, "slack bot identity resolved");
 
     let state = AppState {
         config: config.clone(),
@@ -54,10 +54,9 @@ async fn main() -> Result<()> {
         discord: discord_http,
         discord_guild,
         slack_bot_token,
-        slack_user_token,
         slack: slack_client,
         bot_user_id,
-        credit_re,
+        bot_id,
     };
 
     // Discord gateway client (Discord→Slack direction).

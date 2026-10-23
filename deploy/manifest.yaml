@@ -1,0 +1,35 @@
+# Slack App Manifest — paste into api.slack.com → your app → App Manifest.
+# Sets scopes, Socket Mode and event subscriptions in one save.
+display_information:
+  name: discord-relay
+features:
+  bot_user:
+    display_name: discord-relay
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - groups:history
+      - channels:read
+      - groups:read
+      - users:read
+      - files:read
+      - chat:write
+      - chat:write.customize
+      - files:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - member_joined_channel
+      - member_left_channel
+      - channel_rename
+      - channel_archive
+      - channel_unarchive
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

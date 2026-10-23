@@ -226,9 +226,18 @@ async fn handle_discord_message(
         }
     }
 
-    let text = state.discord_text_for_slack(&msg.content, &author).await;
-    let slack_ts = crate::slack::post_to_slack(state, &pair.slack_channel_id, &text, slack_thread_ts.clone(), files)
-        .await?;
+    let text = state.discord_text_for_slack(&msg.content).await;
+    let username = state.config.slack_username(&author);
+    let slack_ts = crate::slack::post_to_slack(
+        state,
+        &pair.slack_channel_id,
+        &text,
+        &username,
+        Some(msg.author.face()),
+        slack_thread_ts.clone(),
+        files,
+    )
+    .await?;
 
     state
         .db
