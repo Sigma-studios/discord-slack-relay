@@ -474,7 +474,12 @@ async fn handle_discord_message(
     // large (or failed) ones are posted as a link line instead.
     let mut files = Vec::new();
     let mut notices = Vec::new();
-    for att in &msg.attachments {
+    let forwarded = msg.message_snapshots.iter();
+    let all_attachments = msg
+        .attachments
+        .iter()
+        .chain(forwarded.clone().flat_map(|snap| snap.attachments.iter()));
+    for att in all_attachments {
         if u64::from(att.size) > media::INLINE_LIMIT {
             notices.push(format!(
                 "📎 <{}|{}> (too large to mirror, {})",
@@ -497,8 +502,24 @@ async fn handle_discord_message(
 
     let converted = discord_mentions_to_slack(state, ctx, &msg.content, &msg.mentions).await;
     let mut text = state.discord_text_for_slack(&converted).await;
+    // Forwarded messages carry their content in snapshots, not `content`.
+    for snap in forwarded {
+        let quoted = discord_mentions_to_slack(state, ctx, &snap.content, &snap.mentions).await;
+        let quoted = state.discord_text_for_slack(&quoted).await;
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("↪ _Forwarded:_");
+        for line in quoted.lines() {
+            text.push_str(&format!("\n> {line}"));
+        }
+    }
     // Stickers have no Slack equivalent: name them.
-    for sticker in &msg.sticker_items {
+    let stickers = msg
+        .sticker_items
+        .iter()
+        .chain(msg.message_snapshots.iter().flat_map(|snap| snap.sticker_items.iter()));
+    for sticker in stickers {
         if !text.is_empty() {
             text.push('\n');
         }
@@ -605,6 +626,23 @@ async fn resolve_target(
         return Ok((Some(pair), Some(ts)));
     }
 
-    // Unknown thread: fall back to posting top-level in the channel.
-    Ok((Some(pair), None))
+    // A thread with no mirrored starter message (e.g. created from the thread
+    // button): Slack has no free-standing threads, so post a header message in
+    // Slack and use it as the thread's root.
+    let header = format!("🧵 *{}* (thread started on Discord)", gc.name);
+    let ts = crate::slack::post_to_slack(
+        state,
+        &pair.slack_channel_id,
+        &header,
+        "Discord",
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    state
+        .db
+        .map_thread(&pair.slack_channel_id, &ts, &channel.to_string())
+        .await?;
+    Ok((Some(pair), Some(ts)))
 }
