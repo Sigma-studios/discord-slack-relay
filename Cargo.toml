@@ -1,0 +1,31 @@
+[package]
+name = "discord-slack-relay"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+# Slack: Web API + Socket Mode over the hyper/tokio stack.
+slack-morphism = { version = "2", features = ["hyper"] }
+# Discord: gateway, channel management, webhooks.
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "http"] }
+# Storage: async, with the SQLite driver and migrations.
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+once_cell = "1"
+url = "2"
+futures = "0.3"
+secrecy = "0.8"
+
+[profile.release]
+strip = true
+lto = "thin"
