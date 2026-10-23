@@ -89,19 +89,23 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let channel_id = channel.to_string();
     let ts = ev.origin.ts.to_string();
 
-    // Mirror plain messages, file shares and thread broadcasts; skip edits,
-    // deletes, joins and other system subtypes.
+    // Mirror plain messages, file shares and thread broadcasts; route edits and
+    // deletes; skip joins and other system subtypes.
     match &ev.subtype {
         None
         | Some(SlackMessageEventType::FileShare)
         | Some(SlackMessageEventType::ThreadBroadcast) => {}
+        Some(SlackMessageEventType::MessageChanged) => {
+            return handle_slack_edit(state, &channel_id, ev).await;
+        }
+        Some(SlackMessageEventType::MessageDeleted) => {
+            return handle_slack_delete(state, &channel_id, ev).await;
+        }
         Some(_) => return Ok(()),
     }
 
     // Loop prevention: anything our own bot posted (relayed Discord messages).
-    let from_our_bot = ev.sender.bot_id.as_ref().map(|b| b.to_string()) == Some(state.bot_id.clone())
-        || ev.sender.user.as_ref().map(|u| u.to_string()) == Some(state.bot_user_id.clone());
-    if from_our_bot || state.db.is_self_posted(&ts).await? {
+    if is_our_bot(state, &ev.sender) || state.db.is_self_posted(&ts).await? {
         return Ok(());
     }
 
@@ -128,7 +132,7 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let profile = ev.sender.user_profile.as_ref();
     let sender_name = state.slack_display_name(&user_id, profile).await;
     let sender_avatar = state.slack_avatar(&user_id, profile).await;
-    let discord_text = state.slack_text_for_discord(&text).await;
+    let (discord_text, ping_everyone) = state.slack_text_for_discord(&text).await;
 
     // Files: download with the bot token, keep only those small enough inline.
     let mut files = Vec::new();
@@ -147,11 +151,15 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
 
     // Thread handling: a reply (thread_ts present and != ts) goes into a Discord
     // thread hanging off the mirrored parent message.
-    let discord_thread_id = match ev.origin.thread_ts.as_ref().map(|t| t.to_string()) {
-        Some(thread_ts) if thread_ts != ts => {
-            Some(resolve_discord_thread(state, &pair, &channel_id, &thread_ts).await?)
-        }
-        _ => None,
+    let slack_thread_ts = ev
+        .origin
+        .thread_ts
+        .as_ref()
+        .map(|t| t.to_string())
+        .filter(|t| *t != ts);
+    let discord_thread_id = match &slack_thread_ts {
+        Some(thread_ts) => Some(resolve_discord_thread(state, &pair, &channel_id, thread_ts).await?),
+        None => None,
     };
 
     let discord_msg_id = crate::discord::post_to_discord(
@@ -162,13 +170,87 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         &discord_text,
         discord_thread_id,
         files,
+        ping_everyone,
     )
     .await?;
 
+    let discord_thread = discord_thread_id.map(|t| t.to_string());
     state
         .db
-        .map_message(&channel_id, &ts, &discord_msg_id.to_string(), "slack")
+        .map_message(
+            &channel_id,
+            &ts,
+            &discord_msg_id.to_string(),
+            "slack",
+            slack_thread_ts.as_deref(),
+            discord_thread.as_deref(),
+        )
         .await?;
+    Ok(())
+}
+
+fn is_our_bot(state: &AppState, sender: &SlackMessageSender) -> bool {
+    sender.bot_id.as_ref().map(|b| b.to_string()) == Some(state.bot_id.clone())
+        || sender.user.as_ref().map(|u| u.to_string()) == Some(state.bot_user_id.clone())
+}
+
+/// A Slack message was edited → edit its Discord mirror. Only messages that
+/// originated in Slack (our webhook posts) are editable on Discord.
+async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessageEvent) -> Result<()> {
+    let Some(edited) = ev.message.as_ref() else { return Ok(()) };
+    if is_our_bot(state, &edited.sender) {
+        return Ok(());
+    }
+    let text = edited.content.as_ref().and_then(|c| c.text.clone()).unwrap_or_default();
+    // message_changed also fires for link unfurls etc.; skip if the text is unchanged.
+    let prev_text = ev
+        .previous_message
+        .as_ref()
+        .and_then(|p| p.content.as_ref())
+        .and_then(|c| c.text.clone());
+    if prev_text.as_deref() == Some(text.as_str()) {
+        return Ok(());
+    }
+
+    let ts = edited.ts.to_string();
+    let Some(row) = state.db.message_by_slack_ts(channel_id, &ts).await? else {
+        return Ok(());
+    };
+    if row.origin != "slack" {
+        return Ok(());
+    }
+    let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
+
+    let (content, _) = state.slack_text_for_discord(&text).await;
+    let thread_id = row.discord_thread_id.as_deref().map(str::parse).transpose()?;
+    crate::discord::edit_on_discord(state, &pair, row.discord_msg_id.parse()?, thread_id, &content)
+        .await?;
+    tracing::debug!(%channel_id, %ts, "mirrored slack edit to discord");
+    Ok(())
+}
+
+/// A Slack message was deleted → delete its Discord mirror.
+async fn handle_slack_delete(state: &AppState, channel_id: &str, ev: &SlackMessageEvent) -> Result<()> {
+    let Some(ts) = ev
+        .deleted_ts
+        .as_ref()
+        .or(ev.previous_message.as_ref().map(|p| &p.ts))
+        .map(|t| t.to_string())
+    else {
+        return Ok(());
+    };
+    let Some(row) = state.db.message_by_slack_ts(channel_id, &ts).await? else {
+        return Ok(());
+    };
+    if row.origin != "slack" {
+        return Ok(());
+    }
+    let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
+
+    let thread_id = row.discord_thread_id.as_deref().map(str::parse).transpose()?;
+    crate::discord::delete_on_discord(state, &pair, row.discord_msg_id.parse()?, thread_id).await?;
+    state.db.delete_message_mapping(channel_id, &ts).await?;
+    tracing::debug!(%channel_id, %ts, "mirrored slack delete to discord");
     Ok(())
 }
 
@@ -336,7 +418,7 @@ async fn on_push_event(
     };
 
     if let Err(e) = result {
-        tracing::warn!(error = ?e, "slack event handler failed");
+        tracing::error!(error = ?e, "slack event handler failed");
     }
     Ok(())
 }

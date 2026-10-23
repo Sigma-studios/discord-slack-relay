@@ -4,8 +4,8 @@
 use anyhow::{Context, Result};
 use secrecy::ExposeSecret;
 use serenity::all::{
-    ChannelType, CreateAttachment, CreateChannel, CreateThread, CreateWebhook, EditChannel,
-    ExecuteWebhook, GuildId, Webhook,
+    ChannelType, CreateAllowedMentions, CreateAttachment, CreateChannel, CreateThread,
+    CreateWebhook, EditChannel, EditWebhookMessage, ExecuteWebhook, GuildId, Webhook,
 };
 use serenity::async_trait;
 use serenity::model::channel::Message;
@@ -83,6 +83,7 @@ pub async fn archive_channel(state: &AppState, pair: &ChannelPair) -> Result<()>
 
 /// Post a Slack message into the paired Discord channel via its webhook, using
 /// the Slack sender's name and avatar. Returns the created Discord message id.
+#[allow(clippy::too_many_arguments)]
 pub async fn post_to_discord(
     state: &AppState,
     pair: &ChannelPair,
@@ -91,15 +92,14 @@ pub async fn post_to_discord(
     content: &str,
     thread_id: Option<u64>,
     files: Vec<media::DownloadedFile>,
+    ping_everyone: bool,
 ) -> Result<u64> {
-    let webhook = Webhook::from_id_with_token(
-        &state.discord,
-        WebhookId::new(pair.discord_webhook_id.parse::<u64>().context("webhook id")?),
-        &pair.discord_webhook_token,
-    )
-    .await?;
+    let webhook = pair_webhook(state, pair).await?;
 
-    let mut builder = ExecuteWebhook::new().username(sender_name);
+    // Users may be pinged (alias tags); @everyone only when the Slack message
+    // pinged our bot, so a literal "@everyone" from Slack can't mass-ping.
+    let mentions = CreateAllowedMentions::new().all_users(true).everyone(ping_everyone);
+    let mut builder = ExecuteWebhook::new().username(sender_name).allowed_mentions(mentions);
     // Discord rejects empty content; send a zero-width space if text is empty.
     builder = builder.content(if content.is_empty() { "\u{200b}" } else { content });
     if let Some(avatar) = sender_avatar {
@@ -117,6 +117,53 @@ pub async fn post_to_discord(
         .await?
         .context("webhook execute returned no message (need wait=true)")?;
     Ok(msg.id.get())
+}
+
+async fn pair_webhook(state: &AppState, pair: &ChannelPair) -> Result<Webhook> {
+    Ok(Webhook::from_id_with_token(
+        &state.discord,
+        WebhookId::new(pair.discord_webhook_id.parse::<u64>().context("webhook id")?),
+        &pair.discord_webhook_token,
+    )
+    .await?)
+}
+
+/// Edit a webhook message we posted (mirror of a Slack edit).
+pub async fn edit_on_discord(
+    state: &AppState,
+    pair: &ChannelPair,
+    message_id: u64,
+    thread_id: Option<u64>,
+    content: &str,
+) -> Result<()> {
+    let webhook = pair_webhook(state, pair).await?;
+    let mut builder = EditWebhookMessage::new()
+        .content(if content.is_empty() { "\u{200b}" } else { content })
+        // Edits never re-ping on Discord; keep @everyone inert regardless.
+        .allowed_mentions(CreateAllowedMentions::new().all_users(true).everyone(false));
+    if let Some(tid) = thread_id {
+        builder = builder.in_thread(ChannelId::new(tid));
+    }
+    webhook
+        .edit_message(&state.discord, MessageId::new(message_id), builder)
+        .await
+        .context("edit webhook message")?;
+    Ok(())
+}
+
+/// Delete a webhook message we posted (mirror of a Slack delete).
+pub async fn delete_on_discord(
+    state: &AppState,
+    pair: &ChannelPair,
+    message_id: u64,
+    thread_id: Option<u64>,
+) -> Result<()> {
+    let webhook = pair_webhook(state, pair).await?;
+    webhook
+        .delete_message(&state.discord, thread_id.map(ChannelId::new), MessageId::new(message_id))
+        .await
+        .context("delete webhook message")?;
+    Ok(())
 }
 
 /// Create a Discord thread hanging off the mirrored parent message, returning
@@ -167,7 +214,7 @@ pub struct Handler {
 impl EventHandler for Handler {
     async fn message(&self, ctx: SerenityContext, msg: Message) {
         if let Err(e) = handle_discord_message(&self.state, &ctx, &msg).await {
-            tracing::warn!(error = ?e, "discord→slack relay failed");
+            tracing::error!(error = ?e, "discord→slack relay failed");
         }
     }
 }
@@ -205,11 +252,27 @@ async fn handle_discord_message(
     // Resolve the channel: a thread message carries the thread's channel id, so
     // look up the parent to find the mirrored pairing.
     let this_channel = ChannelId::new(msg.channel_id.get());
-    let (pair, slack_thread_ts) = resolve_target(state, ctx, this_channel).await?;
-    let Some(pair) = pair else { return Ok(()) };
+    tracing::debug!(channel = %this_channel, author = %msg.author.name, "discord message received");
+    let (pair, mut slack_thread_ts) = resolve_target(state, ctx, this_channel).await?;
+    let Some(pair) = pair else {
+        tracing::debug!(channel = %this_channel, "discord channel is not mirrored; ignoring");
+        return Ok(());
+    };
     if pair.archived != 0 {
         return Ok(());
     }
+
+    // Discord "Reply" to a mirrored message → post into that message's Slack
+    // thread (or start one under it).
+    if slack_thread_ts.is_none() {
+        if let Some(ref_id) = msg.message_reference.as_ref().and_then(|r| r.message_id) {
+            slack_thread_ts = state
+                .db
+                .slack_thread_root_for_discord_msg(&ref_id.to_string())
+                .await?;
+        }
+    }
+    let in_discord_thread = this_channel.to_string() != pair.discord_channel_id;
 
     let author = msg
         .author
@@ -227,6 +290,10 @@ async fn handle_discord_message(
     }
 
     let text = state.discord_text_for_slack(&msg.content).await;
+    if text.trim().is_empty() && files.is_empty() {
+        tracing::debug!("discord message has no text or files (sticker/embed); skipping");
+        return Ok(());
+    }
     let username = state.config.slack_username(&author);
     let slack_ts = crate::slack::post_to_slack(
         state,
@@ -239,9 +306,19 @@ async fn handle_discord_message(
     )
     .await?;
 
+    tracing::debug!(slack_channel = %pair.slack_channel_id, %slack_ts, "relayed discord message to slack");
+
+    let discord_thread = in_discord_thread.then(|| this_channel.to_string());
     state
         .db
-        .map_message(&pair.slack_channel_id, &slack_ts, &msg.id.to_string(), "discord")
+        .map_message(
+            &pair.slack_channel_id,
+            &slack_ts,
+            &msg.id.to_string(),
+            "discord",
+            slack_thread_ts.as_deref(),
+            discord_thread.as_deref(),
+        )
         .await?;
     Ok(())
 }

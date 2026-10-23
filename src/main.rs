@@ -22,7 +22,13 @@ async fn main() -> Result<()> {
     // Load .env in local dev if present (ignored in container).
     let _ = dotenv_lite();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // Without RUST_LOG, EnvFilter defaults to errors only, which hid every
+        // relay warning in production. Default to our debug + library warnings.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("warn,discord_slack_relay=debug")
+            }),
+        )
         .init();
 
     let config = Arc::new(Config::from_env()?);

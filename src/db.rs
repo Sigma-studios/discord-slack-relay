@@ -14,6 +14,14 @@ pub struct ChannelPair {
     pub archived: i64,
 }
 
+/// A mirrored message's Discord side, for edits and deletes.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MessageRow {
+    pub discord_msg_id: String,
+    pub origin: String,
+    pub discord_thread_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Db {
     pub pool: SqlitePool,
@@ -101,19 +109,60 @@ impl Db {
         slack_ts: &str,
         discord_msg_id: &str,
         origin: &str,
+        slack_thread_ts: Option<&str>,
+        discord_thread_id: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO messages
-                (slack_channel_id, slack_ts, discord_msg_id, origin)
-             VALUES (?, ?, ?, ?)",
+                (slack_channel_id, slack_ts, discord_msg_id, origin,
+                 slack_thread_ts, discord_thread_id)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(slack_channel_id)
         .bind(slack_ts)
         .bind(discord_msg_id)
         .bind(origin)
+        .bind(slack_thread_ts)
+        .bind(discord_thread_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn message_by_slack_ts(
+        &self,
+        slack_channel_id: &str,
+        slack_ts: &str,
+    ) -> Result<Option<MessageRow>> {
+        Ok(sqlx::query_as::<_, MessageRow>(
+            "SELECT discord_msg_id, origin, discord_thread_id FROM messages
+             WHERE slack_channel_id = ? AND slack_ts = ?",
+        )
+        .bind(slack_channel_id)
+        .bind(slack_ts)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn delete_message_mapping(&self, slack_channel_id: &str, slack_ts: &str) -> Result<()> {
+        sqlx::query("DELETE FROM messages WHERE slack_channel_id = ? AND slack_ts = ?")
+            .bind(slack_channel_id)
+            .bind(slack_ts)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The Slack thread a Discord message belongs to: its thread root if it is
+    /// a reply, else its own ts (so replying to it starts a thread there).
+    pub async fn slack_thread_root_for_discord_msg(&self, discord_msg_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(slack_thread_ts, slack_ts) FROM messages
+             WHERE discord_msg_id = ? AND slack_ts != ''",
+        )
+        .bind(discord_msg_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn discord_id_for_slack_ts(

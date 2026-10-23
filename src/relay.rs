@@ -39,6 +39,9 @@ pub struct AppState {
 static SLACK_USER_MENTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"<@([UW][A-Z0-9]+)>").unwrap());
 static SLACK_CHANNEL_REF: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"<#C[A-Z0-9]+\|([^>]+)>").unwrap());
+// `<!here>`, `<!channel>`, `<!everyone>` (optionally `<!here|here>`).
+static SLACK_BROADCAST: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<!(here|channel|everyone)(?:\|[^>]*)?>").unwrap());
 static DISCORD_TO_SLACK_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"@s:([A-Za-z0-9_.-]+)").unwrap());
 static SLACK_TO_DISCORD_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"@d:([A-Za-z0-9_.-]+)").unwrap());
 
@@ -94,20 +97,30 @@ impl AppState {
         }
     }
 
-    /// Prepare Slack message text for posting into Discord.
-    pub async fn slack_text_for_discord(&self, raw: &str) -> String {
+    /// Prepare Slack message text for posting into Discord. Returns the text and
+    /// whether it should ping @everyone (the Slack message mentioned our bot).
+    pub async fn slack_text_for_discord(&self, raw: &str) -> (String, bool) {
         let mut out = raw.to_string();
+        let mut ping_everyone = false;
         for cap in SLACK_USER_MENTION.captures_iter(raw) {
+            if cap[1] == self.bot_user_id {
+                out = out.replace(&cap[0], "@everyone");
+                ping_everyone = true;
+                continue;
+            }
             let name = self.slack_display_name(&cap[1], None).await;
             out = out.replace(&cap[0], &format!("**@{name}**"));
         }
         out = SLACK_CHANNEL_REF.replace_all(&out, "#$1").into_owned();
+        // Slack broadcast mentions render as text only; they never ping Discord
+        // (allowed_mentions restricts @everyone to bot pings).
+        out = SLACK_BROADCAST.replace_all(&out, "@$1").into_owned();
         for cap in SLACK_TO_DISCORD_TAG.captures_iter(&out.clone()) {
             if let Ok(Some(id)) = self.db.discord_id_for_alias(&cap[1]).await {
                 out = out.replace(&cap[0], &format!("<@{id}>"));
             }
         }
-        format::slack_to_discord(&out)
+        (format::slack_to_discord(&out), ping_everyone)
     }
 
     /// Prepare Discord message text for posting into Slack.
