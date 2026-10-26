@@ -7,6 +7,8 @@
 //! author and origin fields, so the message is re-read from the raw Web API.
 
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Deserialize;
 use slack_morphism::prelude::*;
 
@@ -29,6 +31,7 @@ pub struct Quoted {
     text: Option<String>,
     from_url: Option<String>,
     original_url: Option<String>,
+    footer: Option<String>,
     #[serde(default)]
     files: Vec<QuotedFile>,
 }
@@ -52,6 +55,11 @@ pub async fn quoted_in(
     match fetch_attachments(state, channel_id, ts).await {
         Ok(all) => all
             .into_iter()
+            .inspect(|a| {
+                // Field names only: Slack's quote format is undocumented.
+                let keys: Vec<&str> = a.as_object().into_iter().flat_map(|o| o.keys()).map(String::as_str).collect();
+                tracing::debug!(?keys, "slack attachment");
+            })
             .filter_map(|a| serde_json::from_value::<Quoted>(a).ok())
             .filter(|q| q.is_msg_unfurl || q.is_share)
             .collect(),
@@ -136,13 +144,16 @@ pub async fn render(state: &AppState, quotes: &[Quoted]) -> String {
         .or_else(|| q.author_subname.clone())
         .unwrap_or_else(|| "someone".to_string());
 
-        let mirrored = mirror_of(state, q).await.unwrap_or_default();
-        let channel = q
-            .channel_name
-            .clone()
-            .or_else(|| mirrored.as_ref().map(|m| m.0.clone()));
+        let (channel_id, ts) = q.source();
+        let channel = match &channel_id {
+            Some(id) => channel_name(state, q, id).await,
+            None => q.channel_name.clone().or_else(|| footer_channel(q)),
+        };
+        let mirrored = match (&channel_id, &ts) {
+            (Some(c), Some(t)) => mirror_link(state, c, t).await.unwrap_or_default(),
+            _ => None,
+        };
         let link = mirrored
-            .map(|m| m.1)
             .or_else(|| q.from_url.clone())
             .or_else(|| q.original_url.clone());
 
@@ -159,17 +170,64 @@ pub async fn render(state: &AppState, quotes: &[Quoted]) -> String {
     blocks.join("\n")
 }
 
-/// The quoted message's channel name and Discord link, if it's mirrored.
-async fn mirror_of(state: &AppState, q: &Quoted) -> Result<Option<(String, String)>> {
-    let (Some(channel_id), Some(ts)) = (q.channel_id.as_deref(), q.ts.as_ref().and_then(|t| t.as_str())) else {
-        return Ok(None);
-    };
+// `…/archives/C0123/p1700000000000100` → channel C0123, ts 1700000000.000100.
+static PERMALINK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})").unwrap());
+// A footer like "Posted in #general".
+static FOOTER_CHANNEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"#([\w.-]+)").unwrap());
+
+impl Quoted {
+    /// Channel id and ts of the quoted message: the attachment's own fields,
+    /// else read off the permalink.
+    fn source(&self) -> (Option<String>, Option<String>) {
+        let from_link = [&self.original_url, &self.from_url]
+            .into_iter()
+            .flatten()
+            .find_map(|u| PERMALINK.captures(u))
+            .map(|c| (c[1].to_string(), format!("{}.{}", &c[2], &c[3])));
+        let channel = self.channel_id.clone().or_else(|| from_link.as_ref().map(|l| l.0.clone()));
+        let ts = self
+            .ts
+            .as_ref()
+            .and_then(|t| t.as_str().map(str::to_string))
+            .or_else(|| from_link.map(|l| l.1));
+        (channel, ts)
+    }
+}
+
+/// Name of the quoted message's channel. The attachment doesn't always say, so
+/// fall back to our mirror, then `conversations.info` (fine for public channels
+/// the bot isn't in), then the footer.
+async fn channel_name(state: &AppState, q: &Quoted, channel_id: &str) -> Option<String> {
+    if let Some(name) = &q.channel_name {
+        return Some(name.clone());
+    }
+    if let Ok(Some(pair)) = state.db.pair_by_slack(channel_id).await {
+        return Some(pair.slack_channel_name);
+    }
+    let session = state.slack.open_session(&state.slack_bot_token);
+    let req = SlackApiConversationsInfoRequest::new(channel_id.into());
+    match session.conversations_info(&req).await {
+        Ok(info) if info.channel.name.is_some() => info.channel.name,
+        Ok(_) => footer_channel(q),
+        Err(e) => {
+            tracing::debug!(%channel_id, error = ?e, "conversations.info failed for a quoted message");
+            footer_channel(q)
+        }
+    }
+}
+
+fn footer_channel(q: &Quoted) -> Option<String> {
+    q.footer.as_deref().and_then(|f| FOOTER_CHANNEL.captures(f)).map(|c| c[1].to_string())
+}
+
+/// Link to the quoted message's Discord copy, if it was mirrored.
+async fn mirror_link(state: &AppState, channel_id: &str, ts: &str) -> Result<Option<String>> {
     let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(None) };
-    let link = state.db.message_by_slack_ts(channel_id, ts).await?.map(|row| {
-        let container = row.discord_thread_id.unwrap_or_else(|| pair.discord_channel_id.clone());
+    Ok(state.db.message_by_slack_ts(channel_id, ts).await?.map(|row| {
+        let container = row.discord_thread_id.unwrap_or(pair.discord_channel_id);
         format!("https://discord.com/channels/{}/{container}/{}", state.discord_guild, row.discord_msg_id)
-    });
-    Ok(link.map(|l| (pair.slack_channel_name, l)))
+    }))
 }
 
 fn format_quote(name: &str, channel: Option<&str>, link: Option<&str>, body: &str) -> String {
@@ -223,6 +281,18 @@ mod tests {
             format!("↪ **Ann** in [#general](<{URL}>):\n> hi\n> there")
         );
         assert_eq!(format_quote("Ann", None, None, "hi"), "↪ **Ann**:\n> hi");
+    }
+
+    #[test]
+    fn source_falls_back_to_the_permalink() {
+        let q = quote(&format!("{URL}?thread_ts=1699999999.000000&cid=C1"));
+        assert_eq!(q.source(), (Some("C1".into()), Some("1700000000.000100".into())));
+    }
+
+    #[test]
+    fn channel_from_footer() {
+        let q = Quoted { footer: Some("Posted in #dev-ops".into()), ..Default::default() };
+        assert_eq!(footer_channel(&q).as_deref(), Some("dev-ops"));
     }
 
     #[test]
