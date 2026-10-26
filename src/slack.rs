@@ -255,7 +255,11 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let profile = ev.sender.user_profile.as_ref();
     let sender_name = state.slack_display_name(&user_id, profile).await;
     let sender_avatar = state.slack_avatar(&user_id, profile).await;
+    // A pasted permalink or a forward: show the quoted message, not the link.
+    let quotes = crate::quote::quoted_in(state, &channel_id, &ts, content).await;
+    let text = crate::quote::strip_quoted_links(&text, &quotes);
     let (mut discord_text, ping_everyone) = state.slack_text_for_discord(&text).await;
+    push_line(&mut discord_text, &crate::quote::render(state, &quotes).await);
 
     // Files: download with the bot token and re-upload; ones too large (or
     // unavailable) become a line linking back to Slack instead of vanishing.
@@ -288,10 +292,7 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         }
     }
     for notice in notices {
-        if !discord_text.is_empty() {
-            discord_text.push('\n');
-        }
-        discord_text.push_str(&notice);
+        push_line(&mut discord_text, &notice);
     }
 
     // Thread handling: a reply (thread_ts present and != ts) goes into a Discord
@@ -359,6 +360,17 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
         .collect();
     state.db.set_extras(&channel_id, &ts, ROLE_BROADCAST, &broadcast).await?;
     Ok(())
+}
+
+/// Append `line` on its own line (nothing if it's empty).
+fn push_line(text: &mut String, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(line);
 }
 
 /// Extra-message roles (see migration 0004).
@@ -429,17 +441,22 @@ async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessage
         return Ok(());
     }
     let text = edited.content.as_ref().and_then(|c| c.text.clone()).unwrap_or_default();
-    // message_changed also fires for link unfurls etc.; skip if the text is unchanged.
-    let prev_text = ev
-        .previous_message
-        .as_ref()
-        .and_then(|p| p.content.as_ref())
-        .and_then(|c| c.text.clone());
-    if prev_text.as_deref() == Some(text.as_str()) {
+    // message_changed also fires for link unfurls etc.: skip unless the text or
+    // the attachments changed (a quoted message's unfurl can arrive late).
+    let prev = ev.previous_message.as_ref().and_then(|p| p.content.as_ref());
+    let text_changed = prev.and_then(|c| c.text.as_deref()) != Some(text.as_str());
+    let prev_attachments = prev.and_then(|c| c.attachments.as_ref());
+    let attachments = edited.content.as_ref().and_then(|c| c.attachments.as_ref());
+    if !text_changed && prev_attachments == attachments {
         return Ok(());
     }
 
     let ts = edited.ts.to_string();
+    let quotes = crate::quote::quoted_in(state, channel_id, &ts, edited.content.as_ref()).await;
+    // Only a website preview was added: nothing changes on Discord.
+    if !text_changed && quotes.is_empty() {
+        return Ok(());
+    }
     let Some(row) = state.db.message_by_slack_ts(channel_id, &ts).await? else {
         return Ok(());
     };
@@ -448,7 +465,9 @@ async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessage
     }
     let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
 
-    let (content, _) = state.slack_text_for_discord(&text).await;
+    let text = crate::quote::strip_quoted_links(&text, &quotes);
+    let (mut content, _) = state.slack_text_for_discord(&text).await;
+    push_line(&mut content, &crate::quote::render(state, &quotes).await);
 
     // Every part of the mirrored message (it may have been split), in order.
     let mut parts = vec![primary_ref(&row)?];

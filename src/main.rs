@@ -3,6 +3,7 @@ mod db;
 mod discord;
 mod format;
 mod media;
+mod quote;
 mod relay;
 mod slack;
 
