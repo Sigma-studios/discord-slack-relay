@@ -9,7 +9,9 @@ mirroring stops.
   Discord under their own name/avatar (posted through a per-channel webhook).
   Threads become Discord threads; media is re-uploaded (link fallback > ~19 MB).
 - **Discord → Slack**: posted by the bot under the Discord sender's name and
-  avatar (e.g. `alice (Discord)`), carrying the app's APP badge.
+  avatar (e.g. `alice (Discord)`), carrying the app's APP badge. Discord
+  reactions show on Slack as the bot's reaction (one per emoji, held while any
+  Discord user has it).
 - **Tagging**: `@d:alias` in Slack pings a Discord user; `@s:alias` in Discord
   pings a Slack user. Register aliases from Discord:
   - `!alias <name>` — map `<name>` to your Discord account
@@ -27,7 +29,7 @@ Fully wired and building against slack-morphism 2.31 / serenity 0.12:
   replies, attachment re-upload via Slack's external-upload flow, alias pings.
 - Loop prevention: the relay's own posts are dropped by their Slack bot id.
 
-Not yet implemented (intentionally): edit/delete propagation, reactions, DMs,
+Not yet implemented (intentionally): Slack→Discord reactions, DMs,
 history backfill. `cargo test` covers the markup conversions.
 
 **Untested against live services.** It compiles and the pure logic is tested,
@@ -41,7 +43,7 @@ out runtime issues (intents, scope gaps, thread edge cases) during setup.
    → `SLACK_APP_TOKEN`.
 3. **Bot token scopes**: `channels:history`, `groups:history`, `channels:read`,
    `groups:read`, `users:read`, `files:read`, `chat:write`,
-   `chat:write.customize`, `files:write`, `pins:read`. Install → `SLACK_BOT_TOKEN`.
+   `chat:write.customize`, `files:write`, `pins:read`, `reactions:write`. Install → `SLACK_BOT_TOKEN`.
 4. **Event subscriptions** (bot events): `message.channels`, `message.groups`,
    `member_joined_channel`, `member_left_channel`, `channel_rename`,
    `channel_archive`, `channel_unarchive`, `channel_deleted`, `group_rename`,
@@ -56,8 +58,8 @@ events) in one save — see `deploy/manifest.yaml`.
 1. Create a bot (<https://discord.com/developers>), enable the **Message Content**
    intent.
 2. Invite it to your server with **Manage Channels**, **Manage Webhooks**,
-   **Send Messages**, **Create Public Threads**, **Pin Messages** (for mirrored
-   pins).
+   **Send Messages**, **Read Message History** (to count reactions), **Create
+   Public Threads**, **Pin Messages** (for mirrored pins).
 3. Put the server id in `DISCORD_GUILD_ID`, the token in `DISCORD_BOT_TOKEN`.
 
 ## Run locally

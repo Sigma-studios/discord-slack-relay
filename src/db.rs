@@ -187,6 +187,25 @@ impl Db {
         .await?)
     }
 
+    /// (slack channel, slack ts) of the Slack message a Discord message
+    /// mirrors, also when it is one of the extra copies (split part, broadcast).
+    pub async fn slack_msg_for_any_discord_msg(
+        &self,
+        discord_msg_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT slack_channel_id, slack_ts FROM messages
+             WHERE discord_msg_id = ? AND slack_ts != ''
+             UNION ALL
+             SELECT slack_channel_id, slack_ts FROM message_extras WHERE discord_msg_id = ?
+             LIMIT 1",
+        )
+        .bind(discord_msg_id)
+        .bind(discord_msg_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn delete_mapping_by_discord(&self, discord_msg_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM messages WHERE discord_msg_id = ?")
             .bind(discord_msg_id)

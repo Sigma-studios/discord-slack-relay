@@ -19,6 +19,7 @@ oauth_config:
       - chat:write.customize
       - files:write
       - pins:read
+      - reactions:write
 settings:
   event_subscriptions:
     bot_events:

@@ -8,7 +8,7 @@ use serenity::all::{
     CreateWebhook, EditChannel, EditWebhookMessage, ExecuteWebhook, GuildId, Webhook,
 };
 use serenity::async_trait;
-use serenity::model::channel::Message;
+use serenity::model::channel::{Message, Reaction, ReactionType};
 use serenity::model::event::MessageUpdateEvent;
 use serenity::model::gateway::Ready;
 use serenity::model::user::User;
@@ -346,6 +346,73 @@ impl EventHandler for Handler {
         if let Err(e) = handle_discord_delete(&self.state, deleted_message_id).await {
             tracing::error!(error = ?e, "discord→slack delete failed");
         }
+    }
+
+    async fn reaction_add(&self, ctx: SerenityContext, reaction: Reaction) {
+        if let Err(e) = sync_reaction(&self.state, &ctx, &reaction, true).await {
+            tracing::error!(error = ?e, "discord→slack reaction failed");
+        }
+    }
+
+    async fn reaction_remove(&self, ctx: SerenityContext, reaction: Reaction) {
+        if let Err(e) = sync_reaction(&self.state, &ctx, &reaction, false).await {
+            tracing::error!(error = ?e, "discord→slack reaction removal failed");
+        }
+    }
+
+    async fn reaction_remove_emoji(&self, ctx: SerenityContext, reaction: Reaction) {
+        if let Err(e) = sync_reaction(&self.state, &ctx, &reaction, false).await {
+            tracing::error!(error = ?e, "discord→slack reaction removal failed");
+        }
+    }
+}
+
+/// A reaction changed on a mirrored Discord message → the bot holds that
+/// reaction on the Slack copy while at least one Discord user has it (Slack
+/// allows one reaction per emoji per user, so it can't be per reactor).
+async fn sync_reaction(
+    state: &AppState,
+    ctx: &SerenityContext,
+    reaction: &Reaction,
+    added: bool,
+) -> Result<()> {
+    let Some((slack_channel, ts)) = state
+        .db
+        .slack_msg_for_any_discord_msg(&reaction.message_id.to_string())
+        .await?
+    else {
+        return Ok(());
+    };
+    let names = match &reaction.emoji {
+        ReactionType::Unicode(s) => crate::format::slack_reaction_names(s),
+        // Server emoji: works if Slack has a custom emoji of the same name.
+        ReactionType::Custom { name: Some(n), .. } => vec![n.to_lowercase()],
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        return Ok(());
+    }
+    // Re-read the message rather than trusting the event: removing one
+    // person's reaction must keep Slack's while others still have it, and
+    // racing add/remove events then settle on the current state.
+    let present = match ctx.http.get_message(reaction.channel_id, reaction.message_id).await {
+        Ok(msg) => msg.reactions.iter().any(|r| {
+            same_emoji(&r.reaction_type, &reaction.emoji) && r.count > u64::from(r.me)
+        }),
+        Err(e) => {
+            tracing::warn!(error = ?e, "couldn't fetch reacted message; trusting the event");
+            added
+        }
+    };
+    crate::slack::set_reaction_on_slack(state, &slack_channel, &ts, &names, present).await?;
+    tracing::debug!(%slack_channel, %ts, ?names, present, "mirrored discord reaction to slack");
+    Ok(())
+}
+
+fn same_emoji(a: &ReactionType, b: &ReactionType) -> bool {
+    match (a, b) {
+        (ReactionType::Custom { id: x, .. }, ReactionType::Custom { id: y, .. }) => x == y,
+        _ => a == b,
     }
 }
 

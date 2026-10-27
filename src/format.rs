@@ -146,6 +146,34 @@ pub fn encode_entities(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Slack reaction names for a Unicode emoji, best guess first (`👍` → `+1`,
+/// `thumbsup`; `👍🏽` → `+1::skin-tone-4`, …). Empty when it has no shortcode
+/// (e.g. mixed skin tones).
+pub fn slack_reaction_names(emoji: &str) -> Vec<String> {
+    use emojis::SkinTone;
+    let Some(e) = emojis::get(emoji).or_else(|| emojis::get(emoji.trim_end_matches('\u{fe0f}'))) else {
+        return Vec::new();
+    };
+    let tone = match e.skin_tone() {
+        Some(SkinTone::Light) => Some(2),
+        Some(SkinTone::MediumLight) => Some(3),
+        Some(SkinTone::Medium) => Some(4),
+        Some(SkinTone::MediumDark) => Some(5),
+        Some(SkinTone::Dark) => Some(6),
+        _ => None,
+    };
+    let base = match tone {
+        Some(_) => e.with_skin_tone(SkinTone::Default).unwrap_or(e),
+        None => e,
+    };
+    base.shortcodes()
+        .map(|name| match tone {
+            Some(n) => format!("{name}::skin-tone-{n}"),
+            None => name.to_string(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +235,18 @@ mod tests {
         assert_eq!(slack_to_discord(":tada: done"), "🎉 done");
         assert_eq!(slack_to_discord(":wave::skin-tone-3: hi"), "👋 hi");
         assert_eq!(slack_to_discord(":partyparrot: at 10:30:45"), ":partyparrot: at 10:30:45");
+    }
+
+    #[test]
+    fn reaction_names() {
+        assert_eq!(slack_reaction_names("👍").first().map(String::as_str), Some("+1"));
+        assert_eq!(slack_reaction_names("❤️").first().map(String::as_str), Some("heart"));
+        assert_eq!(slack_reaction_names("😂").first().map(String::as_str), Some("joy"));
+        assert_eq!(
+            slack_reaction_names("👍🏽").first().map(String::as_str),
+            Some("+1::skin-tone-4")
+        );
+        assert!(slack_reaction_names("not an emoji").is_empty());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
+use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tokio::sync::mpsc;
 
@@ -186,6 +187,39 @@ pub async fn delete_on_slack(state: &AppState, channel_id: &str, ts: &str) -> Re
     let session = state.slack.open_session(&state.slack_bot_token);
     let req = SlackApiChatDeleteRequest::new(channel_id.into(), ts.into());
     session.chat_delete(&req).await.context("chat.delete")?;
+    Ok(())
+}
+
+/// Add or remove our bot's reaction on a Slack message (mirror of Discord
+/// reactions). `names` are candidate spellings of one emoji, tried in order
+/// until Slack knows the name. Already reacted / already gone is fine.
+pub async fn set_reaction_on_slack(
+    state: &AppState,
+    channel_id: &str,
+    ts: &str,
+    names: &[String],
+    present: bool,
+) -> Result<()> {
+    let session = state.slack.open_session(&state.slack_bot_token);
+    for name in names {
+        let result = if present {
+            let req = SlackApiReactionsAddRequest::new(channel_id.into(), name.clone().into(), ts.into());
+            session.reactions_add(&req).await.map(|_| ())
+        } else {
+            let req = SlackApiReactionsRemoveRequest::new(name.clone().into())
+                .with_channel(channel_id.into())
+                .with_timestamp(ts.into());
+            session.reactions_remove(&req).await.map(|_| ())
+        };
+        match result {
+            Err(SlackClientError::ApiError(e)) if e.code == "invalid_name" => continue,
+            Err(SlackClientError::ApiError(e)) if matches!(e.code.as_str(), "already_reacted" | "no_reaction") => {
+                return Ok(())
+            }
+            other => return other.context(if present { "reactions.add" } else { "reactions.remove" }),
+        }
+    }
+    tracing::debug!(?names, "no Slack emoji matches this reaction; skipped");
     Ok(())
 }
 

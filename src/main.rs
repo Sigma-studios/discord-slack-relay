@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
 
     // Discord gateway client (Discord→Slack direction).
     let intents = GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::GUILD_MESSAGE_REACTIONS
         | GatewayIntents::MESSAGE_CONTENT
         | GatewayIntents::GUILDS;
     let mut discord_client = serenity::Client::builder(&config.discord_bot_token, intents)
