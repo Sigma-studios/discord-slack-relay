@@ -290,10 +290,13 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     let sender_name = state.slack_display_name(&user_id, profile).await;
     let sender_avatar = state.slack_avatar(&user_id, profile).await;
     // A pasted permalink or a forward: show the quoted message, not the link.
-    let quotes = crate::quote::quoted_in(state, &channel_id, &ts, content).await;
-    let text = crate::quote::strip_quoted_links(&text, &quotes);
+    let embeds = crate::quote::embeds_in(state, &channel_id, &ts, content).await;
+    let text = crate::quote::strip_quoted_links(&text, &embeds.quotes);
     let (mut discord_text, ping_everyone) = state.slack_text_for_discord(&text).await;
-    push_line(&mut discord_text, &crate::quote::render(state, &quotes).await);
+    push_line(&mut discord_text, &crate::quote::render(state, &embeds.quotes).await);
+    for url in &embeds.images {
+        push_line(&mut discord_text, url);
+    }
 
     // Files: download with the bot token and re-upload; ones too large (or
     // unavailable) become a line linking back to Slack instead of vanishing.
@@ -486,9 +489,9 @@ async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessage
     }
 
     let ts = edited.ts.to_string();
-    let quotes = crate::quote::quoted_in(state, channel_id, &ts, edited.content.as_ref()).await;
+    let embeds = crate::quote::embeds_in(state, channel_id, &ts, edited.content.as_ref()).await;
     // Only a website preview was added: nothing changes on Discord.
-    if !text_changed && quotes.is_empty() {
+    if !text_changed && embeds.quotes.is_empty() && embeds.images.is_empty() {
         return Ok(());
     }
     let Some(row) = state.db.message_by_slack_ts(channel_id, &ts).await? else {
@@ -499,9 +502,12 @@ async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessage
     }
     let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
 
-    let text = crate::quote::strip_quoted_links(&text, &quotes);
+    let text = crate::quote::strip_quoted_links(&text, &embeds.quotes);
     let (mut content, _) = state.slack_text_for_discord(&text).await;
-    push_line(&mut content, &crate::quote::render(state, &quotes).await);
+    push_line(&mut content, &crate::quote::render(state, &embeds.quotes).await);
+    for url in &embeds.images {
+        push_line(&mut content, url);
+    }
 
     // Every part of the mirrored message (it may have been split), in order.
     let mut parts = vec![primary_ref(&row)?];

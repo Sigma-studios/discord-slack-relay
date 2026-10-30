@@ -5,6 +5,9 @@
 //! the source channel, so Discord can show who said what instead of a Slack
 //! link nobody there can open. slack-morphism's attachment model drops the
 //! author and origin fields, so the message is re-read from the raw Web API.
+//!
+//! The same read finds pictures that only exist as image blocks, such as GIFs
+//! from Slack's picker: they have no text and no file to mirror.
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
@@ -41,38 +44,86 @@ struct QuotedFile {
     name: Option<String>,
 }
 
-/// The messages quoted by Slack message `ts` (none if it has no attachments).
-/// Best effort: a failed lookup just leaves the plain link.
-pub async fn quoted_in(
+/// What a message carries outside its text and files.
+#[derive(Debug, Default)]
+pub struct Embeds {
+    pub quotes: Vec<Quoted>,
+    /// Picture urls, public: Discord previews them when posted as plain links.
+    pub images: Vec<String>,
+}
+
+/// The messages quoted and pictures embedded by Slack message `ts` (none if it
+/// has no attachments or image blocks). Best effort: a failed lookup just
+/// leaves the plain text.
+pub async fn embeds_in(
     state: &AppState,
     channel_id: &str,
     ts: &str,
     content: Option<&SlackMessageContent>,
-) -> Vec<Quoted> {
-    if content.and_then(|c| c.attachments.as_ref()).map_or(true, |a| a.is_empty()) {
-        return Vec::new();
+) -> Embeds {
+    let has_attachments = content.and_then(|c| c.attachments.as_ref()).is_some_and(|a| !a.is_empty());
+    let has_image_block = content
+        .and_then(|c| c.blocks.as_ref())
+        .is_some_and(|b| b.iter().any(|b| matches!(b, SlackBlock::Image(_))));
+    if !has_attachments && !has_image_block {
+        return Embeds::default();
     }
-    match fetch_attachments(state, channel_id, ts).await {
-        Ok(all) => all
-            .into_iter()
-            .inspect(|a| {
-                // Field names only: Slack's quote format is undocumented.
+    match fetch_message(state, channel_id, ts).await {
+        Ok(msg) => {
+            let attachments = msg["attachments"].as_array().map(Vec::as_slice).unwrap_or_default();
+            for a in attachments {
+                // Field names and block types only: Slack's quote format is undocumented.
                 let keys: Vec<&str> = a.as_object().into_iter().flat_map(|o| o.keys()).map(String::as_str).collect();
-                tracing::debug!(?keys, "slack attachment");
-            })
-            .filter_map(|a| serde_json::from_value::<Quoted>(a).ok())
-            .filter(|q| q.is_msg_unfurl || q.is_share)
-            .collect(),
+                let blocks: Vec<&str> = blocks_of(a).filter_map(|b| b["type"].as_str()).collect();
+                tracing::debug!(?keys, ?blocks, "slack attachment");
+            }
+            let quotes = attachments
+                .iter()
+                .filter_map(|a| serde_json::from_value::<Quoted>(a.clone()).ok())
+                .filter(|q| q.is_msg_unfurl || q.is_share)
+                .collect();
+            Embeds { quotes, images: images_in(&msg) }
+        }
         Err(e) => {
-            tracing::warn!(%channel_id, %ts, error = ?e, "couldn't read quoted slack messages");
-            Vec::new()
+            tracing::warn!(%channel_id, %ts, error = ?e, "couldn't read embeds of a slack message");
+            Embeds::default()
         }
     }
 }
 
-/// Raw attachments of one message. `conversations.replies` finds it whether
-/// it's top-level or a thread reply (the parent comes along; filtered by ts).
-async fn fetch_attachments(state: &AppState, channel_id: &str, ts: &str) -> Result<Vec<serde_json::Value>> {
+fn blocks_of(holder: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    holder["blocks"].as_array().into_iter().flatten()
+}
+
+fn image_blocks(holder: &serde_json::Value) -> Vec<String> {
+    blocks_of(holder)
+        .filter(|b| b["type"] == "image")
+        .filter_map(|b| b["image_url"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Urls of the pictures a raw message embeds. Quotes are rendered on their own,
+/// and link previews come back by themselves when Discord sees the link.
+fn images_in(msg: &serde_json::Value) -> Vec<String> {
+    let mut images = image_blocks(msg);
+    for a in msg["attachments"].as_array().into_iter().flatten() {
+        let quoted = a["is_msg_unfurl"] == true || a["is_share"] == true;
+        let preview = a["from_url"].is_string() || a["original_url"].is_string();
+        if quoted || preview {
+            continue;
+        }
+        images.extend(image_blocks(a));
+        images.extend(a["image_url"].as_str().map(str::to_string));
+    }
+    let mut seen = std::collections::HashSet::new();
+    images.retain(|url| seen.insert(url.clone()));
+    images
+}
+
+/// One raw message. `conversations.replies` finds it whether it's top-level or
+/// a thread reply (the parent comes along; filtered by ts).
+async fn fetch_message(state: &AppState, channel_id: &str, ts: &str) -> Result<serde_json::Value> {
     let token = state.slack_bot_token.token_value.value().clone();
     let resp: serde_json::Value = state
         .http
@@ -94,11 +145,11 @@ async fn fetch_attachments(state: &AppState, channel_id: &str, ts: &str) -> Resu
         anyhow::bail!("conversations.replies: {}", resp["error"]);
     }
     let messages = resp["messages"].as_array().context("no messages")?;
-    let msg = messages
+    messages
         .iter()
         .find(|m| m["ts"] == ts)
-        .context("message not returned")?;
-    Ok(msg["attachments"].as_array().cloned().unwrap_or_default())
+        .cloned()
+        .context("message not returned")
 }
 
 /// Drop the permalinks Slack turned into quotes: the quote replaces them.
@@ -293,6 +344,43 @@ mod tests {
     fn channel_from_footer() {
         let q = Quoted { footer: Some("Posted in #dev-ops".into()), ..Default::default() };
         assert_eq!(footer_channel(&q).as_deref(), Some("dev-ops"));
+    }
+
+    #[test]
+    fn gif_attachment_gives_its_picture() {
+        let gif = "https://media.giphy.com/media/abc/giphy.gif";
+        let msg = serde_json::json!({
+            "text": "",
+            "attachments": [{
+                "id": 1, "fallback": "480x270px image",
+                "blocks": [{ "type": "image", "image_url": gif, "alt_text": "cat" }],
+            }],
+        });
+        assert_eq!(images_in(&msg), [gif]);
+    }
+
+    #[test]
+    fn other_picture_shapes_are_found_once() {
+        let url = "https://example.com/a.gif";
+        let msg = serde_json::json!({
+            "blocks": [
+                { "type": "rich_text", "elements": [] },
+                { "type": "image", "image_url": url, "alt_text": "" },
+            ],
+            "attachments": [{ "id": 1, "image_url": url }],
+        });
+        assert_eq!(images_in(&msg), [url]);
+    }
+
+    #[test]
+    fn previews_and_quotes_add_no_picture() {
+        let msg = serde_json::json!({
+            "attachments": [
+                { "from_url": "https://example.com", "image_url": "https://example.com/p.png" },
+                { "is_msg_unfurl": true, "blocks": [{ "type": "image", "image_url": "https://example.com/q.png" }] },
+            ],
+        });
+        assert!(images_in(&msg).is_empty());
     }
 
     #[test]
