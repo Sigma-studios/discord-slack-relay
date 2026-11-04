@@ -19,6 +19,7 @@ oauth_config:
       - chat:write.customize
       - files:write
       - pins:read
+      - reactions:read
       - reactions:write
 settings:
   event_subscriptions:
@@ -37,6 +38,8 @@ settings:
       - group_deleted
       - pin_added
       - pin_removed
+      - reaction_added
+      - reaction_removed
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

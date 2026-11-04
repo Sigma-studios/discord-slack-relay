@@ -8,6 +8,10 @@ mirroring stops.
 - **Slack → Discord**: real-time via Socket Mode. Each Slack sender appears in
   Discord under their own name/avatar (posted through a per-channel webhook).
   Threads become Discord threads; media is re-uploaded (link fallback > ~19 MB).
+  Slack reactions appear as a small last line naming everyone who reacted
+  (`👍 3 Antonin, Antoine D, Antoine L · 🎉 Marie`): first names, plus enough
+  last-name letters to tell apart namesakes in the channel. Only on messages
+  from Slack (a Discord user's own message can't be edited by the bot).
 - **Discord → Slack**: posted by the bot under the Discord sender's name and
   avatar (e.g. `alice (Discord)`), carrying the app's APP badge. Discord
   reactions show on Slack as the bot's reaction (one per emoji, held while any
@@ -29,7 +33,7 @@ Fully wired and building against slack-morphism 2.31 / serenity 0.12:
   replies, attachment re-upload via Slack's external-upload flow, alias pings.
 - Loop prevention: the relay's own posts are dropped by their Slack bot id.
 
-Not yet implemented (intentionally): Slack→Discord reactions, DMs,
+Not yet implemented (intentionally): DMs,
 history backfill. `cargo test` covers the markup conversions.
 
 **Untested against live services.** It compiles and the pure logic is tested,
@@ -43,11 +47,12 @@ out runtime issues (intents, scope gaps, thread edge cases) during setup.
    → `SLACK_APP_TOKEN`.
 3. **Bot token scopes**: `channels:history`, `groups:history`, `channels:read`,
    `groups:read`, `users:read`, `files:read`, `chat:write`,
-   `chat:write.customize`, `files:write`, `pins:read`, `reactions:write`. Install → `SLACK_BOT_TOKEN`.
+   `chat:write.customize`, `files:write`, `pins:read`, `reactions:read`, `reactions:write`. Install → `SLACK_BOT_TOKEN`.
 4. **Event subscriptions** (bot events): `message.channels`, `message.groups`,
    `member_joined_channel`, `member_left_channel`, `channel_rename`,
    `channel_archive`, `channel_unarchive`, `channel_deleted`, `group_rename`,
-   `group_archive`, `group_unarchive`, `group_deleted`, `pin_added`, `pin_removed`.
+   `group_archive`, `group_unarchive`, `group_deleted`, `pin_added`, `pin_removed`,
+   `reaction_added`, `reaction_removed`.
 5. Invite the bot to a channel: `/invite @yourbot`.
 
 Tip: the **App Manifest** page sets all of the above (scopes, Socket Mode,

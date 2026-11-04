@@ -411,8 +411,8 @@ fn push_line(text: &mut String, line: &str) {
 }
 
 /// Extra-message roles (see migration 0004).
-const ROLE_PART: &str = "part";
-const ROLE_BROADCAST: &str = "broadcast";
+pub(crate) const ROLE_PART: &str = "part";
+pub(crate) const ROLE_BROADCAST: &str = "broadcast";
 
 /// Text of the main-channel copy of an "also send to channel" reply.
 fn broadcast_text(discord_text: &str) -> String {
@@ -509,23 +509,25 @@ async fn handle_slack_edit(state: &AppState, channel_id: &str, ev: &SlackMessage
         push_line(&mut content, url);
     }
 
-    // Every part of the mirrored message (it may have been split), in order.
+    // Every part of the mirrored message (it may have been split), in order;
+    // Slack reactions stay as the last line.
+    let reaction_line = state.db.reaction_line(channel_id, &ts).await?.unwrap_or_default();
     let mut parts = vec![primary_ref(&row)?];
     parts.extend(state.db.extras(channel_id, &ts, ROLE_PART).await?);
-    let kept = crate::discord::sync_edit(state, &pair, &parts, &content).await?;
+    let kept = crate::discord::sync_edit(state, &pair, &parts, &content, &reaction_line).await?;
     state.db.set_extras(channel_id, &ts, ROLE_PART, &kept[1..]).await?;
 
     // The main-channel copy of an "also send to channel" reply follows too.
     let broadcast = state.db.extras(channel_id, &ts, ROLE_BROADCAST).await?;
     if !broadcast.is_empty() {
-        let kept = crate::discord::sync_edit(state, &pair, &broadcast, &broadcast_text(&content)).await?;
+        let kept = crate::discord::sync_edit(state, &pair, &broadcast, &broadcast_text(&content), &reaction_line).await?;
         state.db.set_extras(channel_id, &ts, ROLE_BROADCAST, &kept).await?;
     }
     tracing::debug!(%channel_id, %ts, "mirrored slack edit to discord");
     Ok(())
 }
 
-fn primary_ref(row: &crate::db::MessageRow) -> Result<DiscordMsgRef> {
+pub(crate) fn primary_ref(row: &crate::db::MessageRow) -> Result<DiscordMsgRef> {
     Ok(DiscordMsgRef {
         message_id: row.discord_msg_id.parse()?,
         thread_id: row.discord_thread_id.as_deref().map(str::parse).transpose()?,
@@ -842,6 +844,8 @@ fn queue_key(body: &SlackEventCallbackBody) -> String {
         SlackEventCallbackBody::ChannelUnarchive(ev) => Some(ev.channel.to_string()),
         SlackEventCallbackBody::ChannelRename(ev) => Some(ev.channel.id.to_string()),
         SlackEventCallbackBody::ChannelDeleted(ev) => Some(ev.channel.to_string()),
+        SlackEventCallbackBody::ReactionAdded(ev) => reacted_message(&ev.item).map(|(c, _)| c),
+        SlackEventCallbackBody::ReactionRemoved(ev) => reacted_message(&ev.item).map(|(c, _)| c),
         SlackEventCallbackBody::Unknown(v) => Some(raw_channel_id(v)).filter(|c| !c.is_empty()),
         _ => None,
     };
@@ -881,12 +885,32 @@ async fn dispatch(state: &AppState, body: SlackEventCallbackBody) -> Result<()> 
             }
         }
         SlackEventCallbackBody::ChannelDeleted(ev) => archive_deleted(state, ev.channel.as_ref()).await,
+        SlackEventCallbackBody::ReactionAdded(ev) => on_reaction(state, &ev.user, &ev.item).await,
+        SlackEventCallbackBody::ReactionRemoved(ev) => on_reaction(state, &ev.user, &ev.item).await,
         SlackEventCallbackBody::Unknown(v) => handle_raw_event(state, &v).await,
         other => {
             tracing::trace!(?other, "unhandled slack event");
             Ok(())
         }
     }
+}
+
+/// (channel, ts) of a reacted message; None for reactions on files.
+fn reacted_message(item: &SlackReactionsItem) -> Option<(String, String)> {
+    match item {
+        SlackReactionsItem::Message(m) => Some((m.origin.channel.as_ref()?.to_string(), m.origin.ts.to_string())),
+        SlackReactionsItem::File(_) => None,
+    }
+}
+
+/// A Slack reaction changed. The relay bot's own reactions mirror Discord's
+/// and are left out of the line, so they can't change it.
+async fn on_reaction(state: &AppState, user: &SlackUserId, item: &SlackReactionsItem) -> Result<()> {
+    if user.to_string() == state.bot_user_id {
+        return Ok(());
+    }
+    let Some((channel_id, ts)) = reacted_message(item) else { return Ok(()) };
+    crate::reactions::sync_from_slack(state, &channel_id, &ts).await
 }
 
 async fn set_archived(state: &AppState, channel_id: &str, archived: bool) -> Result<()> {

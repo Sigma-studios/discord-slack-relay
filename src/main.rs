@@ -4,6 +4,7 @@ mod discord;
 mod format;
 mod media;
 mod quote;
+mod reactions;
 mod relay;
 mod slack;
 

@@ -140,22 +140,28 @@ pub async fn post_to_discord(
 /// Apply an edited text to the Discord messages that mirror one Slack message
 /// (its split parts, in order): edit each part, delete parts the shorter text
 /// no longer needs, and fold any overflow into the last part (truncated: a
-/// part can't be inserted between existing messages). Returns the parts kept.
+/// part can't be inserted between existing messages). `reaction_line` (may be
+/// empty) ends the last kept part. Returns the parts kept.
 pub async fn sync_edit(
     state: &AppState,
     pair: &ChannelPair,
     parts: &[DiscordMsgRef],
     text: &str,
+    reaction_line: &str,
 ) -> Result<Vec<DiscordMsgRef>> {
     let chunks = crate::format::split_for_discord(text, crate::format::DISCORD_MAX_CHARS);
+    let last_kept = chunks.len().min(parts.len()) - 1;
     let mut kept = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if i < chunks.len() {
-            let content = if i + 1 == parts.len() && chunks.len() > parts.len() {
+            let mut content = if i + 1 == parts.len() && chunks.len() > parts.len() {
                 chunks[i..].join("\n")
             } else {
                 chunks[i].clone()
             };
+            if i == last_kept {
+                content = crate::reactions::attach(&content, reaction_line);
+            }
             edit_on_discord(state, pair, part.message_id, part.thread_id, &content).await?;
             kept.push(*part);
         } else {
@@ -199,6 +205,21 @@ pub async fn edit_on_discord(
         .await
         .context("edit webhook message")?;
     Ok(())
+}
+
+/// Current content of a webhook message we posted.
+pub async fn webhook_message_content(state: &AppState, pair: &ChannelPair, msg: DiscordMsgRef) -> Result<String> {
+    let webhook = pair_webhook(state, pair).await?;
+    let message = webhook
+        .get_message(&state.discord, msg.thread_id.map(ChannelId::new), MessageId::new(msg.message_id))
+        .await
+        .context("get webhook message")?;
+    Ok(message.content)
+}
+
+/// The Discord message no longer exists (deleted by hand on Discord).
+pub fn is_unknown_message(err: &anyhow::Error) -> bool {
+    has_discord_code(err, &[10008])
 }
 
 /// Delete a webhook message we posted (mirror of a Slack delete).

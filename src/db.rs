@@ -152,7 +152,7 @@ impl Db {
     }
 
     pub async fn delete_message_mapping(&self, slack_channel_id: &str, slack_ts: &str) -> Result<()> {
-        for table in ["messages", "message_extras"] {
+        for table in ["messages", "message_extras", "reaction_lines"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE slack_channel_id = ? AND slack_ts = ?"))
                 .bind(slack_channel_id)
                 .bind(slack_ts)
@@ -218,7 +218,7 @@ impl Db {
     /// Discord channel was deleted and must be recreated).
     pub async fn reset_channel(&self, slack_channel_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        for table in ["messages", "message_extras", "threads", "channel_topics", "channel_pairs"] {
+        for table in ["messages", "message_extras", "reaction_lines", "threads", "channel_topics", "channel_pairs"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE slack_channel_id = ?"))
                 .bind(slack_channel_id)
                 .execute(&mut *tx)
@@ -345,6 +345,33 @@ impl Db {
         .bind(discord_msg_id)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    // ── reaction lines ──────────────────────────────────────────────────────
+
+    pub async fn reaction_line(&self, slack_channel_id: &str, slack_ts: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT line FROM reaction_lines WHERE slack_channel_id = ? AND slack_ts = ?",
+        )
+        .bind(slack_channel_id)
+        .bind(slack_ts)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Remember the line written for a message (an empty line forgets it).
+    pub async fn set_reaction_line(&self, slack_channel_id: &str, slack_ts: &str, line: &str) -> Result<()> {
+        let query = if line.is_empty() {
+            "DELETE FROM reaction_lines WHERE slack_channel_id = ? AND slack_ts = ?"
+        } else {
+            "INSERT OR REPLACE INTO reaction_lines (slack_channel_id, slack_ts, line) VALUES (?, ?, ?)"
+        };
+        let mut q = sqlx::query(query).bind(slack_channel_id).bind(slack_ts);
+        if !line.is_empty() {
+            q = q.bind(line);
+        }
+        q.execute(&self.pool).await?;
+        Ok(())
     }
 
     // ── threads ──────────────────────────────────────────────────────
