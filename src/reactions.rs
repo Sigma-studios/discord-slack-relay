@@ -7,8 +7,10 @@
 //! of the last name as it takes to tell apart others in the channel with the
 //! same first name.
 //!
-//! Only messages that came from Slack get the line: a Discord user's own
-//! message can't be edited by the bot.
+//! A message written on Discord can't be edited by the bot, so its line goes
+//! in a bot message ("note") in the message's Discord thread instead, opened
+//! for it if needed. Messages already inside a thread get the note as a reply
+//! there (Discord threads don't nest).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -18,7 +20,7 @@ use once_cell::sync::Lazy;
 use slack_morphism::prelude::*;
 use tokio::sync::Mutex;
 
-use crate::db::{ChannelPair, DiscordMsgRef};
+use crate::db::{ChannelPair, DiscordMsgRef, MessageRow, ReactionNote};
 use crate::format::DISCORD_MAX_CHARS;
 use crate::relay::AppState;
 
@@ -174,13 +176,12 @@ pub async fn sync_from_slack(state: &AppState, channel_id: &str, ts: &str) -> Re
     let Some(row) = state.db.message_by_slack_ts(channel_id, ts).await? else {
         return Ok(());
     };
-    if row.origin != "slack" {
-        // A Discord user's message: the bot can't edit it.
-        return Ok(());
-    }
     let Some(pair) = state.db.pair_by_slack(channel_id).await? else { return Ok(()) };
-
     let line = current_line(state, channel_id, ts).await?;
+    if row.origin != "slack" {
+        return sync_note(state, &pair, channel_id, ts, &row, &line).await;
+    }
+
     let stored = state.db.reaction_line(channel_id, ts).await?.unwrap_or_default();
     if line == stored {
         return Ok(());
@@ -196,6 +197,98 @@ pub async fn sync_from_slack(state: &AppState, channel_id: &str, ts: &str) -> Re
     state.db.set_reaction_line(channel_id, ts, &line).await?;
     tracing::debug!(%channel_id, %ts, %line, "mirrored slack reactions to discord");
     Ok(())
+}
+
+/// The note's text: the reaction line, labelled as coming from Slack.
+pub fn note_content(line: &str) -> String {
+    let body = line.strip_prefix(MARK).unwrap_or(line);
+    crate::format::truncate_for_discord(&format!("-# Slack: {body}"))
+}
+
+/// Keep the note for a Discord-written message in step with its Slack reactions.
+async fn sync_note(
+    state: &AppState,
+    pair: &ChannelPair,
+    channel_id: &str,
+    ts: &str,
+    row: &MessageRow,
+    line: &str,
+) -> Result<()> {
+    let note = state.db.reaction_note(channel_id, ts).await?;
+    if note.as_ref().map_or("", |n| n.line.as_str()) == line {
+        return Ok(());
+    }
+    if line.is_empty() {
+        return drop_note(state, channel_id, ts).await;
+    }
+    let content = note_content(line);
+    let created_before = note.as_ref().is_some_and(|n| n.created_thread != 0);
+
+    // Edit the note in place; if someone deleted it, post a new one.
+    if let Some(n) = &note {
+        if let (Some(cid), Some(mid)) = (parse_id(&n.note_channel_id), parse_id(&n.note_msg_id)) {
+            match crate::discord::edit_own(state, cid, mid, &content).await {
+                Ok(()) => {
+                    let updated = ReactionNote { line: line.to_string(), ..n.clone() };
+                    state.db.set_reaction_note(channel_id, ts, &updated).await?;
+                    tracing::debug!(%channel_id, %ts, "updated slack reaction note on discord");
+                    return Ok(());
+                }
+                Err(e) if crate::discord::is_unknown_message(&e) || crate::discord::is_gone(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    let original: u64 = row.discord_msg_id.parse()?;
+    let (channel, reply_to, created) = match &row.discord_thread_id {
+        // Already inside a thread: reply to it there.
+        Some(thread) => (thread.parse()?, Some(original), false),
+        None => match state.db.discord_thread_for(channel_id, ts).await? {
+            Some(thread) => (thread.parse()?, None, created_before),
+            None => {
+                let (thread, created) = match crate::discord::create_thread_on(state, pair, original, "thread").await {
+                    Ok(t) => (t, true),
+                    // Started on Discord already: a message's thread shares its id.
+                    Err(e) if crate::discord::is_thread_exists(&e) => (original, false),
+                    Err(e) => return Err(e),
+                };
+                // Now this message's thread on both sides: Slack replies land
+                // in it and Discord replies in it reach the Slack thread.
+                state.db.map_thread(channel_id, ts, &thread.to_string()).await?;
+                (thread, None, created)
+            }
+        },
+    };
+    let note_id = crate::discord::post_quiet(state, channel, reply_to, &content).await?;
+    let stored = ReactionNote {
+        line: line.to_string(),
+        note_msg_id: Some(note_id.to_string()),
+        note_channel_id: Some(channel.to_string()),
+        created_thread: i64::from(created),
+    };
+    state.db.set_reaction_note(channel_id, ts, &stored).await?;
+    tracing::debug!(%channel_id, %ts, thread = channel, "posted slack reaction note on discord");
+    Ok(())
+}
+
+/// Remove a Discord-written message's reaction note, and the thread it was
+/// opened for if nobody else wrote there.
+pub async fn drop_note(state: &AppState, channel_id: &str, ts: &str) -> Result<()> {
+    let Some(note) = state.db.reaction_note(channel_id, ts).await? else { return Ok(()) };
+    if let (Some(cid), Some(mid)) = (parse_id(&note.note_channel_id), parse_id(&note.note_msg_id)) {
+        crate::discord::delete_own(state, cid, mid).await?;
+        if note.created_thread != 0 && crate::discord::delete_thread_if_empty(state, cid).await? {
+            state.db.unmap_thread(channel_id, ts).await?;
+        }
+    }
+    state.db.set_reaction_line(channel_id, ts, "").await?;
+    tracing::debug!(%channel_id, %ts, "removed slack reaction note on discord");
+    Ok(())
+}
+
+fn parse_id(id: &Option<String>) -> Option<u64> {
+    id.as_deref().and_then(|s| s.parse().ok())
 }
 
 async fn rewrite(state: &AppState, pair: &ChannelPair, msg: DiscordMsgRef, line: &str) -> Result<()> {
@@ -480,6 +573,12 @@ mod tests {
         // A file-only message (zero-width placeholder) gets just the line.
         assert_eq!(attach("\u{200b}", &line1), line1);
         assert_eq!(attach(&line1, ""), "");
+    }
+
+    #[test]
+    fn note_is_labelled_small_text() {
+        let line = format!("{MARK}👍 2 Antonin, Marie");
+        assert_eq!(note_content(&line), "-# Slack: 👍 2 Antonin, Marie");
     }
 
     #[test]

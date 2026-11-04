@@ -22,6 +22,15 @@ pub struct MessageRow {
     pub discord_thread_id: Option<String>,
 }
 
+/// The bot message holding Slack reactions for a message written on Discord.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReactionNote {
+    pub line: String,
+    pub note_msg_id: Option<String>,
+    pub note_channel_id: Option<String>,
+    pub created_thread: i64,
+}
+
 /// One Discord message (and the thread it lives in, if any).
 #[derive(Debug, Clone, Copy)]
 pub struct DiscordMsgRef {
@@ -374,6 +383,34 @@ impl Db {
         Ok(())
     }
 
+    pub async fn reaction_note(&self, slack_channel_id: &str, slack_ts: &str) -> Result<Option<ReactionNote>> {
+        Ok(sqlx::query_as::<_, ReactionNote>(
+            "SELECT line, note_msg_id, note_channel_id, created_thread FROM reaction_lines
+             WHERE slack_channel_id = ? AND slack_ts = ?",
+        )
+        .bind(slack_channel_id)
+        .bind(slack_ts)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn set_reaction_note(&self, slack_channel_id: &str, slack_ts: &str, note: &ReactionNote) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO reaction_lines
+                (slack_channel_id, slack_ts, line, note_msg_id, note_channel_id, created_thread)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(slack_channel_id)
+        .bind(slack_ts)
+        .bind(&note.line)
+        .bind(&note.note_msg_id)
+        .bind(&note.note_channel_id)
+        .bind(note.created_thread)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ── threads ──────────────────────────────────────────────────────
 
     pub async fn map_thread(
@@ -392,6 +429,15 @@ impl Db {
         .bind(discord_thread_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn unmap_thread(&self, slack_channel_id: &str, slack_thread_ts: &str) -> Result<()> {
+        sqlx::query("DELETE FROM threads WHERE slack_channel_id = ? AND slack_thread_ts = ?")
+            .bind(slack_channel_id)
+            .bind(slack_thread_ts)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use secrecy::ExposeSecret;
 use serenity::all::{
     ChannelType, CreateAllowedMentions, CreateAttachment, CreateChannel, CreateThread,
-    CreateWebhook, EditChannel, EditWebhookMessage, ExecuteWebhook, GuildId, Webhook,
+    CreateMessage, CreateWebhook, EditChannel, EditMessage, EditWebhookMessage, ExecuteWebhook, GetMessages,
+    GuildId, MessageFlags, MessageType, Webhook,
 };
 use serenity::async_trait;
 use serenity::model::channel::{Message, Reaction, ReactionType};
@@ -220,6 +221,63 @@ pub async fn webhook_message_content(state: &AppState, pair: &ChannelPair, msg: 
 /// The Discord message no longer exists (deleted by hand on Discord).
 pub fn is_unknown_message(err: &anyhow::Error) -> bool {
     has_discord_code(err, &[10008])
+}
+
+/// Post a bot message that pings nobody and notifies no one, optionally as a
+/// reply to `reply_to` (in the same channel). Returns its id.
+pub async fn post_quiet(state: &AppState, channel: u64, reply_to: Option<u64>, content: &str) -> Result<u64> {
+    let cid = ChannelId::new(channel);
+    let mut builder = CreateMessage::new()
+        .content(content)
+        .allowed_mentions(CreateAllowedMentions::new())
+        .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
+    if let Some(original) = reply_to {
+        builder = builder.reference_message((cid, MessageId::new(original)));
+    }
+    let msg = cid.send_message(&state.discord, builder).await.context("send bot message")?;
+    Ok(msg.id.get())
+}
+
+/// Edit a message the bot posted itself.
+pub async fn edit_own(state: &AppState, channel: u64, message: u64, content: &str) -> Result<()> {
+    ChannelId::new(channel)
+        .edit_message(&state.discord, MessageId::new(message), EditMessage::new().content(content))
+        .await
+        .context("edit bot message")?;
+    Ok(())
+}
+
+/// Delete a message the bot posted itself; already gone is fine.
+pub async fn delete_own(state: &AppState, channel: u64, message: u64) -> Result<()> {
+    let result = ChannelId::new(channel)
+        .delete_message(&state.discord, MessageId::new(message))
+        .await
+        .map_err(anyhow::Error::from);
+    match result {
+        Err(e) if has_discord_code(&e, &[10003, 10008]) => Ok(()),
+        other => other.context("delete bot message"),
+    }
+}
+
+/// Delete a thread if no one wrote in it (the starter preview doesn't count).
+/// Returns whether it was deleted (or was already gone).
+pub async fn delete_thread_if_empty(state: &AppState, thread: u64) -> Result<bool> {
+    let cid = ChannelId::new(thread);
+    let msgs = match cid.messages(&state.discord, GetMessages::new().limit(5)).await.map_err(anyhow::Error::from) {
+        Ok(m) => m,
+        Err(e) if has_discord_code(&e, &[10003]) => return Ok(true),
+        Err(e) => return Err(e).context("read thread"),
+    };
+    if msgs.iter().any(|m| m.kind != MessageType::ThreadStarterMessage) {
+        return Ok(false);
+    }
+    cid.delete(&state.discord).await.context("delete thread")?;
+    Ok(true)
+}
+
+/// The message already has a thread (one started on Discord).
+pub fn is_thread_exists(err: &anyhow::Error) -> bool {
+    has_discord_code(err, &[160004])
 }
 
 /// Delete a webhook message we posted (mirror of a Slack delete).
@@ -477,6 +535,7 @@ async fn handle_discord_delete(state: &AppState, message_id: MessageId) -> Resul
     let file_ids = state.db.slack_file_ids_for_discord_msg(&id).await?;
     crate::slack::delete_files_on_slack(state, &file_ids).await;
     crate::slack::delete_on_slack(state, &slack_channel, &ts).await?;
+    crate::reactions::drop_note(state, &slack_channel, &ts).await?;
     state.db.delete_mapping_by_discord(&id).await?;
     tracing::debug!(%slack_channel, %ts, "mirrored discord delete to slack");
     Ok(())

@@ -10,8 +10,11 @@ mirroring stops.
   Threads become Discord threads; media is re-uploaded (link fallback > ~19 MB).
   Slack reactions appear as a small last line naming everyone who reacted
   (`👍 3 Antonin, Antoine D, Antoine L · 🎉 Marie`): first names, plus enough
-  last-name letters to tell apart namesakes in the channel. Only on messages
-  from Slack (a Discord user's own message can't be edited by the bot).
+  last-name letters to tell apart namesakes in the channel. A message written
+  on Discord can't be edited by the bot, so its Slack reactions go in a quiet
+  bot message (`Slack: 👍 2 …`) in that message's thread, opened if needed
+  (and removed again with the last reaction if nobody wrote in it); inside a
+  thread, that bot message is a reply to it.
 - **Discord → Slack**: posted by the bot under the Discord sender's name and
   avatar (e.g. `alice (Discord)`), carrying the app's APP badge. Discord
   reactions show on Slack as the bot's reaction (one per emoji, held while any
