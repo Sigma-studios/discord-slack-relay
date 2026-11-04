@@ -315,7 +315,7 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
                 continue;
             };
             let token = token_value(&state.slack_bot_token);
-            match media::download_slack_file(&state.http, url.as_str(), &name, &token).await {
+            match media::download_slack_file(url.as_str(), &name, &token).await {
                 Ok(media::Download::File(f)) => files.push(f),
                 Ok(media::Download::TooLarge(size)) => notices.push(format!(
                     "📎 {link} (too large to mirror, {}; open in Slack)",
