@@ -199,10 +199,13 @@ pub async fn sync_from_slack(state: &AppState, channel_id: &str, ts: &str) -> Re
     Ok(())
 }
 
-/// The note's text: the reaction line, labelled as coming from Slack.
-pub fn note_content(line: &str) -> String {
+/// The note's text: the reaction line, labelled as Slack's. A note that
+/// replies to its message just says so; one in the message's own thread may
+/// sit below other replies, so it names the message it is about.
+pub fn note_content(line: &str, is_reply: bool) -> String {
     let body = line.strip_prefix(MARK).unwrap_or(line);
-    crate::format::truncate_for_discord(&format!("-# Slack: {body}"))
+    let label = if is_reply { "Slack reactions" } else { "Slack reactions to the original message" };
+    crate::format::truncate_for_discord(&format!("-# {label}: {body}"))
 }
 
 /// Keep the note for a Discord-written message in step with its Slack reactions.
@@ -221,7 +224,8 @@ async fn sync_note(
     if line.is_empty() {
         return drop_note(state, channel_id, ts).await;
     }
-    let content = note_content(line);
+    // Inside a thread already, the note replies to the message there.
+    let content = note_content(line, row.discord_thread_id.is_some());
     let created_before = note.as_ref().is_some_and(|n| n.created_thread != 0);
 
     // Edit the note in place; if someone deleted it, post a new one.
@@ -578,7 +582,11 @@ mod tests {
     #[test]
     fn note_is_labelled_small_text() {
         let line = format!("{MARK}👍 2 Antonin, Marie");
-        assert_eq!(note_content(&line), "-# Slack: 👍 2 Antonin, Marie");
+        assert_eq!(note_content(&line, true), "-# Slack reactions: 👍 2 Antonin, Marie");
+        assert_eq!(
+            note_content(&line, false),
+            "-# Slack reactions to the original message: 👍 2 Antonin, Marie"
+        );
     }
 
     #[test]

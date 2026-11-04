@@ -12,7 +12,8 @@ mirroring stops.
   (`👍 3 Antonin, Antoine D, Antoine L · 🎉 Marie`): first names, plus enough
   last-name letters to tell apart namesakes in the channel. A message written
   on Discord can't be edited by the bot, so its Slack reactions go in a quiet
-  bot message (`Slack: 👍 2 …`) in that message's thread, opened if needed
+  bot message (`Slack reactions to the original message: 👍 2 …`) in that
+  message's thread, opened if needed
   (and removed again with the last reaction if nobody wrote in it); inside a
   thread, that bot message is a reply to it.
 - **Discord → Slack**: posted by the bot under the Discord sender's name and
