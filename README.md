@@ -34,7 +34,9 @@ Fully wired and building against slack-morphism 2.31 / serenity 0.12:
 - Slack→Discord: name + avatar via the event profile (users.info fallback),
   thread mirroring, inline media re-upload (≤ ~19 MB), mention/markup rewrite.
 - Discord→Slack: posts via the bot under the sender's name/avatar, thread
-  replies, attachment re-upload via Slack's external-upload flow, alias pings.
+  replies, attachment re-upload via Slack's external-upload flow (Slack shows
+  uploads under the bot's name, so the caption starts with the sender's),
+  alias pings.
 - Loop prevention: the relay's own posts are dropped by their Slack bot id.
 
 Not yet implemented (intentionally): DMs,
@@ -92,3 +94,11 @@ facade deploy relay
 No inbound ports are needed — both Slack Socket Mode and the Discord gateway are
 outbound websockets. The Dockerfile `HEALTHCHECK` watches the heartbeat file on
 the volume, so a wedged process fails its health gate.
+
+Discord uploads relayed before the relay linked its own uploads (Nov 2026) can
+be linked after the fact, which also syncs their Slack reactions and puts the
+sender's name in the caption. Safe to rerun:
+
+```sh
+facade exec relay -- relay backfill-uploads [days, default 90]
+```

@@ -64,6 +64,12 @@ impl Db {
         .await?)
     }
 
+    pub async fn all_pairs(&self) -> Result<Vec<ChannelPair>> {
+        Ok(sqlx::query_as::<_, ChannelPair>("SELECT * FROM channel_pairs")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     pub async fn pair_by_discord(&self, discord_channel_id: &str) -> Result<Option<ChannelPair>> {
         Ok(sqlx::query_as::<_, ChannelPair>(
             "SELECT * FROM channel_pairs WHERE discord_channel_id = ?",

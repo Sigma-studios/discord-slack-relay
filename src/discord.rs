@@ -511,13 +511,22 @@ async fn handle_discord_edit(
     else {
         return Ok(());
     };
-    // Only our bot's own Slack posts are editable; file shares have no ts.
+    // Only our bot's own Slack posts are editable (and uploads once linked).
     if origin != "discord" || ts.is_empty() {
         return Ok(());
     }
     let mentions = ev.mentions.clone().unwrap_or_default();
     let converted = discord_mentions_to_slack(state, ctx, content, &mentions).await;
-    let text = state.discord_text_for_slack(&converted).await;
+    let mut text = state.discord_text_for_slack(&converted).await;
+    // An upload's caption starts with the sender's name; keep it.
+    if !state.db.slack_file_ids_for_discord_msg(&ev.id.to_string()).await?.is_empty() {
+        let author = match &ev.author {
+            Some(a) => a.clone(),
+            None => ev.channel_id.message(&state.discord, ev.id).await?.author,
+        };
+        let name = author.global_name.clone().unwrap_or_else(|| author.name.clone());
+        text = crate::slack::upload_caption(&state.config.slack_username(&name), &text);
+    }
     crate::slack::update_on_slack(state, &slack_channel, &ts, &text).await?;
     tracing::debug!(%slack_channel, %ts, "mirrored discord edit to slack");
     Ok(())

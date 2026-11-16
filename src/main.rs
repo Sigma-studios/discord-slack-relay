@@ -1,3 +1,4 @@
+mod backfill;
 mod config;
 mod db;
 mod discord;
@@ -68,6 +69,13 @@ async fn main() -> Result<()> {
         bot_user_id,
         bot_id,
     };
+
+    // One-off repair run inside the container: `relay backfill-uploads [days]`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("backfill-uploads") {
+        let days = args.get(1).and_then(|d| d.parse().ok()).unwrap_or(90);
+        return backfill::backfill_uploads(&state, days).await;
+    }
 
     // Discord gateway client (Discord→Slack direction).
     let intents = GatewayIntents::GUILD_MESSAGES

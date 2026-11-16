@@ -56,6 +56,22 @@ fn claim_upload(file_ids: &[String]) -> Option<Arc<PendingUpload>> {
     Some(pending)
 }
 
+/// Caption of a relayed Discord upload. Slack shows uploads under the bot's
+/// own name (files.completeUploadExternal ignores `username`), so the
+/// sender's name leads the text in bold.
+pub fn upload_caption(username: &str, text: &str) -> String {
+    let name = username
+        .replace('*', "")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    if text.trim().is_empty() {
+        format!("*{name}*")
+    } else {
+        format!("*{name}*\n{text}")
+    }
+}
+
 /// Post a relayed Discord message into Slack as the bot, shown under the
 /// Discord sender's name and avatar (`chat:write.customize`). `thread_ts` set →
 /// threaded reply. `files` non-empty → external upload flow with the text as
@@ -122,7 +138,7 @@ pub async fn post_to_slack(
 
     let mut complete = SlackApiFilesCompleteUploadExternalRequest::new(completed)
         .with_channel_id(slack_channel_id.into())
-        .with_initial_comment(text.to_string())
+        .with_initial_comment(upload_caption(username, text))
         .with_username(username.to_string());
     if let Some(tts) = thread_ts {
         complete = complete.with_thread_ts(tts.into());
@@ -925,6 +941,13 @@ async fn set_archived(state: &AppState, channel_id: &str, archived: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_caption_leads_with_the_sender() {
+        assert_eq!(upload_caption("Arluc (Discord)", ""), "*Arluc (Discord)*");
+        assert_eq!(upload_caption("Arluc (Discord)", "look"), "*Arluc (Discord)*\nlook");
+        assert_eq!(upload_caption("*a<b* (Discord)", " "), "*a&lt;b (Discord)*");
+    }
 
     #[test]
     fn redelivered_events_are_dropped() {
