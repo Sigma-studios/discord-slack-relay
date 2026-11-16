@@ -17,7 +17,7 @@ use crate::relay::AppState;
 type SlackHyperConnector = slack_morphism::prelude::SlackClientHyperHttpsConnector;
 
 /// Which Discord message an upload mirrors. Slack's upload API doesn't return
-/// the share message's ts, but the share arrives as our own `file_share` event;
+/// the share message's ts, but the share arrives as our own message event;
 /// the link is registered under the file ids before sharing, so that event can
 /// complete the mapping (making the message editable and deletable later).
 #[derive(Clone)]
@@ -136,7 +136,7 @@ pub async fn post_to_slack(
     Ok(String::new())
 }
 
-/// Our own `file_share` event: link it to the Discord message it mirrors.
+/// Our own upload's message event: link it to the Discord message it mirrors.
 async fn link_own_upload(state: &AppState, channel_id: &str, ts: &str, ev: &SlackMessageEvent) -> Result<()> {
     let ids: Vec<String> = ev
         .content
@@ -144,7 +144,13 @@ async fn link_own_upload(state: &AppState, channel_id: &str, ts: &str, ev: &Slac
         .and_then(|c| c.files.as_ref())
         .map(|fs| fs.iter().map(|f| f.id.to_string()).collect())
         .unwrap_or_default();
-    let Some(pending) = claim_upload(&ids) else { return Ok(()) };
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let Some(pending) = claim_upload(&ids) else {
+        tracing::debug!(%channel_id, %ts, ?ids, "own upload with no pending discord link");
+        return Ok(());
+    };
     state
         .db
         .map_message(
@@ -250,12 +256,10 @@ pub async fn handle_slack_message(state: &AppState, ev: &SlackMessageEvent) -> R
     }
 
     // Loop prevention: anything our own bot posted (relayed Discord messages).
-    // Our own file shares are only used to learn the ts of an upload.
+    // Our own uploads are only used to learn their ts. Slack delivers a bot's
+    // upload as a plain message carrying files, not as a `file_share`.
     if is_our_bot(state, &ev.sender) {
-        if matches!(ev.subtype, Some(SlackMessageEventType::FileShare)) {
-            return link_own_upload(state, &channel_id, &ts, ev).await;
-        }
-        return Ok(());
+        return link_own_upload(state, &channel_id, &ts, ev).await;
     }
     if state.db.is_self_posted(&ts).await? {
         return Ok(());
