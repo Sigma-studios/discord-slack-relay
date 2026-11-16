@@ -9,6 +9,7 @@ use anyhow::Result;
 use serenity::builder::GetMessages;
 use serenity::model::channel::Message;
 use serenity::model::id::{ChannelId, MessageId};
+use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 
 use crate::db::ChannelPair;
@@ -40,6 +41,25 @@ pub async fn backfill_uploads(state: &AppState, days: u64) -> Result<()> {
     Ok(())
 }
 
+/// Run a Slack call, waiting out rate limits (history and replies are
+/// rate-limited and a channel can have many threads).
+async fn slack_retry<T, F, Fut>(mut call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, SlackClientError>>,
+{
+    loop {
+        match call().await {
+            Err(SlackClientError::RateLimitError(e)) => {
+                let wait = e.retry_after.unwrap_or(std::time::Duration::from_secs(10));
+                tracing::debug!(?wait, "slack rate limit; waiting");
+                tokio::time::sleep(wait + std::time::Duration::from_millis(500)).await;
+            }
+            r => return Ok(r?),
+        }
+    }
+}
+
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -66,12 +86,12 @@ async fn unlinked_uploads(state: &AppState, channel: &str, oldest: f64) -> Resul
         if let Some(c) = cursor.take() {
             req = req.with_cursor(c);
         }
-        let resp = session.conversations_history(&req).await?;
+        let resp = slack_retry(|| session.conversations_history(&req)).await?;
         for m in resp.messages {
             if m.parent.reply_count.unwrap_or(0) > 0 {
                 let replies = SlackApiConversationsRepliesRequest::new(channel.into(), m.origin.ts.clone())
                     .with_limit(200);
-                let r = session.conversations_replies(&replies).await?;
+                let r = slack_retry(|| session.conversations_replies(&replies)).await?;
                 all.extend(r.messages.into_iter().filter(|r| r.origin.ts != m.origin.ts));
             }
             all.push(m);
